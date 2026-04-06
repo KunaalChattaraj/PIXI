@@ -25,7 +25,6 @@ time.sleep(1.0)  # Wait after connection
 print("Sending zero setpoint to unlock safety...")
 cf.commander.send_setpoint(0, 0, 0, 0)
 time.sleep(0.1)
-
 # Flight parameters
 roll = 0.0
 pitch = 0.0
