@@ -1,3 +1,5 @@
+#Present working code.
+
 #!/usr/bin/env python3
 """
 LiteWing Drone Control + ESP32-CAM Video — GTK + GStreamer
@@ -65,8 +67,10 @@ Gst.init(None)
 cflib.crtp.init_drivers()
 
 # ── Config - defaults, overridable from the command line ────────────────────
-DRONE_URI = "udp://10.114.33.101"
-CAM_URL = "http://10.114.33.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
+# DRONE_URI = "udp://10.114.33.101"
+# CAM_URL = "http://10.114.33.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
+DRONE_URI = "udp://192.168.0.11"
+CAM_URL = "http://192.168.0.101:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
                                               # (port 80 serves the control page only)
 
 # Manual control tuning
