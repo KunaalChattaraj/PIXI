@@ -72,6 +72,18 @@ cflib.crtp.init_drivers()
 DRONE_URI = "udp://192.168.0.11"
 CAM_URL = "http://192.168.0.100:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
                                               # (port 80 serves the control page only)
+# Second physical ESP32-CAM. UPDATE THIS to your real second camera's IP -
+# this is a placeholder. The other 7 tiles in the 3x3 grid intentionally
+# have no URL and never attempt a connection at all.
+CAM_URL_2 = "http://192.168.0.102:81/stream"
+
+# Which camera tile is paired with the one real, connected drone (self.cf
+# etc.). Only this tile's HUD overlay gets fed real attitude telemetry -
+# every other tile (even ones with a live camera, like CAM2) has no real
+# drone attached yet, so their overlay must stay untouched rather than
+# mirroring this drone's roll/pitch. Update this if the real drone ever
+# moves to a different tile.
+REAL_DRONE_TILE_INDEX = 0
 
 # Manual control tuning
 ROLL_PITCH_STEP = 2.0
@@ -143,8 +155,6 @@ window { background-color: #0a0a0a; }
 #log_view { background-color: #0a0a0a; color: #66cc88; font-family: monospace; font-size: 10px; }
 button { font-family: monospace; }
 #control_panel { background-color: rgba(10, 10, 10, 0.92); border-left: 1px solid #1a3a1a; }
-#menu_toggle { background-color: rgba(10, 10, 10, 0.75); color: #00ff88; border: 1px solid #00aa55;
-               font-size: 16px; font-weight: bold; padding: 6px 12px; }
 #estop_btn { background-color: #3a0808; color: #ff4444; border: 2px solid #cc2222;
              font-size: 14px; font-weight: bold; padding: 10px 0px; }
 #arm_confirm { background-color: #3a2a08; color: #ffcc00; border: 1px solid #cc9900;
@@ -468,6 +478,277 @@ class VideoTiltOverlayPainter:
         cr.fill()
 
 
+class CameraTile:
+    """One cell in the 3x3 camera grid.
+
+    If cam_url is None, this tile NEVER attempts a GStreamer pipeline - it
+    just draws a static "NO CAMERA" placeholder once and stays idle
+    forever. No wasted reconnect attempts, no phantom errors for the 7
+    empty slots.
+
+    If cam_url is set, this tile owns its own xvimagesink pipeline,
+    watchdog, and reconnect-with-backoff logic - fully independent of
+    every other tile, so one camera stalling or erroring never affects
+    the other live camera (or any of the empty ones).
+    """
+
+    def __init__(self, app, index, cam_url):
+        self.app = app  # DroneVideoApp - for gui_log() only now; HUD is per-tile
+        self.index = index
+        self.cam_url = cam_url
+        self.is_live = cam_url is not None
+
+        self.pipeline = None
+        self.running = False
+        self.tilt_overlay = VideoTiltOverlayPainter() if self.is_live else None
+        self._overlay_frame_size = (640, 480)
+
+        # Per-tile HUD state - independent per camera, not a single global
+        # flag anymore. Each live tile gets its own dropdown to control
+        # this (see the Gtk.MenuButton/Popover built below).
+        self.video_hud_enabled = True if self.is_live else False
+
+        self._frame_count = 0
+        self._last_frame_count = -1
+        self._reconnect_tries = 0
+        self._watchdog_id = None
+        self._reconnect_timeout_id = None
+        self._user_stopped = False
+
+        # ---- widgets ----
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        label_text = (f"CAM{index+1}: {cam_url.split('/')[2]}" if self.is_live
+                      else f"CAM{index+1}: --")
+        self.status_lbl = Gtk.Label(label=label_text)
+        self.status_lbl.set_name("status_off")
+        self.status_lbl.set_xalign(0)
+        header.pack_start(self.status_lbl, True, True, 2)
+
+        # Menu dropdown - EVERY tile gets one now, live or not, since drone
+        # control (this tile's panel) is independent of whether a camera
+        # is actually attached. The panel itself decides real vs dummy.
+        self.hud_menu_btn = Gtk.MenuButton(label="Menu ▾")
+        self.hud_menu_btn.set_name("hud_dropdown_btn")
+
+        popover = Gtk.Popover()
+        popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        panel_btn = Gtk.Button(label="☰ Open Control Panel")
+        panel_btn.set_relief(Gtk.ReliefStyle.NONE)
+        panel_btn.get_child().set_xalign(0)
+        panel_btn.connect("clicked", self._on_open_control_panel_clicked)
+        popover_box.pack_start(panel_btn, False, False, 0)
+
+        popover_box.show_all()
+        popover.add(popover_box)
+        self._popover = popover  # kept so we can popdown() after clicking
+        self.hud_menu_btn.set_popover(popover)
+        header.pack_start(self.hud_menu_btn, False, False, 2)
+
+        self.box.pack_start(header, False, False, 2)
+
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_name("video_area")
+        self.box.pack_start(self.drawing_area, True, True, 0)
+
+        if self.is_live:
+            # Connect BEFORE show_all() realizes it, same reasoning as the
+            # original single-camera version.
+            self.drawing_area.connect("realize", lambda w: GLib.idle_add(self.start))
+        else:
+            self.drawing_area.connect("draw", self._draw_placeholder)
+
+    def _draw_placeholder(self, widget, cr):
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        cr.set_source_rgb(0.03, 0.03, 0.03)
+        cr.paint()
+        cr.set_source_rgb(0.22, 0.22, 0.22)
+        cr.select_font_face("monospace", 0, 0)
+        cr.set_font_size(12)
+        text = "NO CAMERA"
+        extents = cr.text_extents(text)
+        cr.move_to(w / 2 - extents.width / 2, h / 2 + extents.height / 2)
+        cr.show_text(text)
+        return False
+
+    def build_pipeline(self):
+        if self.video_hud_enabled:
+            pipe_str = (
+                f'souphttpsrc location="{self.cam_url}" is-live=true do-timestamp=true '
+                f'! multipartdemux '
+                f'! image/jpeg '
+                f'! jpegdec '
+                f'! videoconvert '
+                f'! video/x-raw,format=BGRx '
+                f'! cairooverlay name=tiltoverlay '
+                f'! videoconvert '
+                f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
+                f'! xvimagesink name=sink sync=false'
+            )
+        else:
+            pipe_str = (
+                f'souphttpsrc location="{self.cam_url}" is-live=true do-timestamp=true '
+                f'! multipartdemux '
+                f'! image/jpeg '
+                f'! jpegdec '
+                f'! videoconvert '
+                f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
+                f'! xvimagesink name=sink sync=false'
+            )
+        print(f"[INFO] CAM{self.index+1} pipeline (HUD={self.video_hud_enabled}):\n{pipe_str}\n")
+        pipeline = Gst.parse_launch(pipe_str)
+
+        if self.video_hud_enabled:
+            tiltoverlay = pipeline.get_by_name('tiltoverlay')
+            tiltoverlay.connect('caps-changed', self._on_overlay_caps_changed)
+            tiltoverlay.connect('draw', self._on_overlay_draw)
+
+        sink = pipeline.get_by_name('sink')
+        gdk_window = self.drawing_area.get_window()
+        if gdk_window is None:
+            raise RuntimeError(f"CAM{self.index+1} drawing area not realized yet")
+        sink.set_window_handle(gdk_window.get_xid())
+
+        sink_pad = sink.get_static_pad('sink')
+        sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
+
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+        return pipeline
+
+    def _on_frame_probe(self, pad, info):
+        self._frame_count += 1
+        return Gst.PadProbeReturn.OK
+
+    def _on_overlay_caps_changed(self, overlay, caps):
+        struct = caps.get_structure(0)
+        w = struct.get_value('width')
+        h = struct.get_value('height')
+        if w and h:
+            self._overlay_frame_size = (w, h)
+
+    def _on_overlay_draw(self, overlay, cr, timestamp, duration):
+        w, h = self._overlay_frame_size
+        self.tilt_overlay.paint(cr, w, h)
+
+    def start(self):
+        if not self.is_live or self._user_stopped:
+            return False
+        self._frame_count = 0  # reset on every (re)start - see camera_server.py
+                                # bug writeup for why this matters
+        try:
+            self.pipeline = self.build_pipeline()
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self.running = True
+            self.status_lbl.set_text(f"CAM{self.index+1}: {self.cam_url.split('/')[2]}  LIVE")
+            self.status_lbl.set_name("status_ok")
+            self._start_watchdog()
+        except Exception as e:
+            self.status_lbl.set_text(f"CAM{self.index+1} failed: {e}")
+            self.status_lbl.set_name("status_bad")
+        return False  # one-shot idle callback
+
+    def _start_watchdog(self):
+        if self._watchdog_id is None:
+            self._last_frame_count = -1
+            self._watchdog_id = GLib.timeout_add(
+                VIDEO_WATCHDOG_PERIOD_MS, self._watchdog_tick)
+
+    def _stop_watchdog(self):
+        if self._watchdog_id is not None:
+            GLib.source_remove(self._watchdog_id)
+            self._watchdog_id = None
+
+    def _watchdog_tick(self):
+        if self._user_stopped or not self.running:
+            return True
+        if self._frame_count == self._last_frame_count:
+            self.app.gui_log(f"[CAM{self.index+1}] Feed stalled - reconnecting...")
+            self._attempt_reconnect()
+        else:
+            if self._reconnect_tries:
+                self.app.gui_log(f"[CAM{self.index+1}] Feed recovered.")
+            self._reconnect_tries = 0
+        self._last_frame_count = self._frame_count
+        return True
+
+    def _attempt_reconnect(self):
+        if self._user_stopped or self._reconnect_timeout_id is not None:
+            return
+        self.stop()
+        self._reconnect_tries += 1
+        delay_s = min(2 ** (self._reconnect_tries - 1), VIDEO_RECONNECT_MAX_DELAY_S)
+        self.status_lbl.set_text(f"CAM{self.index+1}: reconnecting in {delay_s}s...")
+        self.status_lbl.set_name("status_bad")
+        self._reconnect_timeout_id = GLib.timeout_add_seconds(delay_s, self._reconnect_fire)
+
+    def _reconnect_fire(self):
+        self._reconnect_timeout_id = None
+        if not self._user_stopped:
+            self.start()
+        return False  # one-shot
+
+    def stop(self):
+        self._stop_watchdog()
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        self.running = False
+
+    def toggle(self):
+        """Called from the app-level Start/Stop Camera button."""
+        if not self.is_live:
+            return
+        if self._user_stopped:
+            self._user_stopped = False
+            self._reconnect_tries = 0
+            self.status_lbl.set_text(f"CAM{self.index+1}: connecting...")
+            self.status_lbl.set_name("status_off")
+            GLib.idle_add(self.start)
+        else:
+            self._user_stopped = True
+            if self._reconnect_timeout_id is not None:
+                GLib.source_remove(self._reconnect_timeout_id)
+                self._reconnect_timeout_id = None
+            self.stop()
+            self.status_lbl.set_text(f"CAM{self.index+1}: stopped by user")
+            self.status_lbl.set_name("status_off")
+
+    def _on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"[CAM{self.index+1} ERROR] {err.message}\n[DEBUG] {debug}")
+            self.app.gui_log(f"[CAM{self.index+1} ERROR] {err.message}")
+            self.stop()
+            self.status_lbl.set_text(f"CAM{self.index+1} error: {err.message}")
+            self.status_lbl.set_name("status_bad")
+            self._attempt_reconnect()
+        elif t == Gst.MessageType.EOS:
+            self.app.gui_log(f"[CAM{self.index+1}] Stream ended.")
+            self.stop()
+            self._attempt_reconnect()
+
+    def _on_open_control_panel_clicked(self, button):
+        self._popover.popdown()
+        self.app.show_panel_for_tile(self.index)
+
+    def set_attitude(self, roll, pitch):
+        if self.tilt_overlay is not None:
+            self.tilt_overlay.set_attitude(roll, pitch)
+
+    def shutdown(self):
+        self._user_stopped = True
+        if self._reconnect_timeout_id is not None:
+            GLib.source_remove(self._reconnect_timeout_id)
+            self._reconnect_timeout_id = None
+        self.stop()
+
+
 class DroneVideoApp(Gtk.Window):
 
     def __init__(self):
@@ -485,28 +766,14 @@ class DroneVideoApp(Gtk.Window):
         self.calib_offset = {"roll": 0.0, "pitch": 0.0}
 
         # ── Video/pipeline state ──────────────────────────────────────────
-        self.video_pipeline = None
-        self.video_running = False
-        # Always-on, safe: redraws on the GUI thread, never touches the
-        # video pipeline.
+        # 9-tile grid; only the tiles with a real cam_url actually build a
+        # pipeline (see _build_ui). Populated there since tiles need
+        # widgets built first. HUD is a per-tile setting now (each live
+        # tile has its own dropdown), not a single global flag.
+        self.camera_tiles = []
+        # Always-on, safe: redraws on the GUI thread, never touches any
+        # video pipeline. Independent of the camera grid entirely.
         self.attitude_indicator = AttitudeIndicator()
-        # Opt-in: only actually used when video_hud_enabled is True (see
-        # _build_video_pipeline) - state is kept updated regardless so
-        # it's ready the instant the user toggles it on.
-        # ON by default now that paint() is cached/throttled (see
-        # VideoTiltOverlayPainter's docstring) - the checkbox remains as
-        # an escape hatch if you ever want to rule it out while debugging.
-        self.video_hud_enabled = True
-        self.video_tilt_overlay = VideoTiltOverlayPainter()
-
-        # ── Video watchdog / reconnect state ─────────────────────────────
-        self._frame_count = 0           # incremented by a pad probe per buffer
-        self._last_frame_count = -1     # what the watchdog saw last check
-        self._reconnect_tries = 0
-        self._watchdog_id = None
-        self._reconnect_timeout_id = None   # pending scheduled reconnect, if any
-        self._video_user_stopped = False    # True = user pressed Stop Camera;
-                                             # suppresses all auto-reconnect
 
         # ── Two-step arm state ────────────────────────────────────────────
         self._arm_pending = False
@@ -559,22 +826,27 @@ class DroneVideoApp(Gtk.Window):
         overlay = Gtk.Overlay()
         self.add(overlay)
 
-        # ---------------- Base layer: full-window video ----------------
-        video_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        # ---------------- Base layer: 3x3 camera grid ----------------
+        # CAM1 (slot 0): real camera + real drone, unchanged.
+        # CAM2 (slot 1): real camera now (2nd physical ESP32-CAM) - video
+        # only, no real drone wired up yet (its panel stays the same
+        # disabled dummy placeholder as before - see _build_dummy_panel).
+        # CAM3-CAM9: still fully dummy - no camera, no drone.
+        cam_urls_for_grid = [CAM_URL, CAM_URL_2] + [None] * 7
 
-        self.video_status_lbl = Gtk.Label(label=f"CAM: {CAM_URL.split('/')[2]}  //  connecting...")
-        self.video_status_lbl.set_name("status_off")
-        self.video_status_lbl.set_xalign(0)
-        video_box.pack_start(self.video_status_lbl, False, False, 4)
+        video_grid = Gtk.Grid()
+        video_grid.set_row_homogeneous(True)
+        video_grid.set_column_homogeneous(True)
+        video_grid.set_row_spacing(2)
+        video_grid.set_column_spacing(2)
 
-        self.video_area = Gtk.DrawingArea()
-        self.video_area.set_name("video_area")
-        # Connect BEFORE show_all() - show_all() realizes widgets immediately,
-        # firing "realize" right then.
-        self.video_area.connect("realize", self._on_video_area_realize)
-        video_box.pack_start(self.video_area, True, True, 0)
+        for i, url in enumerate(cam_urls_for_grid):
+            tile = CameraTile(self, i, url)
+            self.camera_tiles.append(tile)
+            row, col = divmod(i, 3)
+            video_grid.attach(tile.box, col, row, 1, 1)
 
-        overlay.add(video_box)
+        overlay.add(video_grid)
 
         # ---------------- Overlay: slide-out control panel ----------------
         self.control_revealer = Gtk.Revealer()
@@ -629,9 +901,10 @@ class DroneVideoApp(Gtk.Window):
         btn_row.pack_start(self.stop_btn, True, True, 0)
         left.pack_start(btn_row, False, False, 6)
 
-        # Camera control - independent of the drone connection
-        self.cam_btn = Gtk.Button(label="Stop Camera")
-        self.cam_btn.connect("clicked", lambda *_: self.toggle_camera())
+        # Camera control - independent of the drone connection, toggles
+        # BOTH live cameras together
+        self.cam_btn = Gtk.Button(label="Stop Cameras")
+        self.cam_btn.connect("clicked", lambda *_: self.toggle_cameras())
         left.pack_start(self.cam_btn, False, False, 4)
 
         # Telemetry
@@ -659,18 +932,9 @@ class DroneVideoApp(Gtk.Window):
         calib_btn.connect("clicked", lambda *_: self.do_calibrate())
         left.pack_start(calib_btn, False, False, 4)
 
-        # ON by default: bakes the tilt reference onto the video itself.
-        # The draw callback is now cached/throttled to the 10Hz telemetry
-        # rate (see VideoTiltOverlayPainter) instead of redoing full HUD
-        # math on every video frame - that was the actual cause of the
-        # earlier freeze/disconnect under GIL contention. This checkbox is
-        # kept as an escape hatch: if you ever want to rule the overlay
-        # out while debugging a video issue, turn it off here and the
-        # pipeline rebuilds without it immediately.
-        self.video_hud_check = Gtk.CheckButton(label="HUD on video (uncheck to rule out if debugging)")
-        self.video_hud_check.set_active(True)
-        self.video_hud_check.connect("toggled", self._on_video_hud_toggled)
-        left.pack_start(self.video_hud_check, False, False, 4)
+        # HUD control now lives per-camera-tile in the grid itself (see
+        # CameraTile's "HUD ▾" dropdown) instead of one global checkbox
+        # here - each camera can have HUD on or off independently.
 
         # Manual control
         manual_label = Gtk.Label(label="MANUAL CONTROL")
@@ -735,34 +999,91 @@ class DroneVideoApp(Gtk.Window):
         left.pack_start(self.log_view, False, False, 4)
 
         panel_scroll.add(left)
-        self.control_revealer.add(panel_scroll)
-        overlay.add_overlay(self.control_revealer)
 
-        # ---------------- Overlay: toggle button (added LAST = topmost) ----
-        self.menu_toggle_btn = Gtk.Button(label="☰")
-        self.menu_toggle_btn.set_name("menu_toggle")
-        self.menu_toggle_btn.set_halign(Gtk.Align.END)
-        self.menu_toggle_btn.set_valign(Gtk.Align.START)
-        self.menu_toggle_btn.set_margin_end(8)
-        self.menu_toggle_btn.set_margin_top(8)
-        self.menu_toggle_btn.connect("clicked", lambda *_: self._toggle_control_panel())
-        overlay.add_overlay(self.menu_toggle_btn)
+        # ---- Panel stack: tile 0 = the real, fully-functional panel
+        # built above. Tiles 1-8 = lightweight dummy placeholders (no
+        # hardware wired yet) showing a distinct drone IP each, so you
+        # can see the per-drone menu format before you have real
+        # hardware for them. Only ONE panel is ever visible in the
+        # revealer at a time; opening a tile's Menu -> Open Control
+        # Panel switches the stack to that tile's page.
+        self.panel_stack = Gtk.Stack()
+        self.panel_stack.add_named(panel_scroll, "panel0")
+
+        self.dummy_drone_uris = [f"udp://192.168.0.{20 + i}" for i in range(1, 9)]
+        for i, dummy_uri in enumerate(self.dummy_drone_uris, start=1):
+            dummy_panel = self._build_dummy_panel(i, dummy_uri)
+            self.panel_stack.add_named(dummy_panel, f"panel{i}")
+
+        self.control_revealer.add(self.panel_stack)
+        overlay.add_overlay(self.control_revealer)
 
         self.show_all()
         self.control_revealer.set_reveal_child(False)
 
-    def _toggle_control_panel(self):
-        showing = self.control_revealer.get_reveal_child()
-        self.control_revealer.set_reveal_child(not showing)
-        # Defensive: explicitly re-raise the toggle button's own window
-        # above everything else in the overlay every time. Add-order alone
-        # (button added after the revealer) should be enough on its own,
-        # but this guarantees the button stays clickable for the *next*
-        # press even if some nested widget inside the panel disturbs GTK's
-        # stacking order - cheap, and removes any doubt.
-        win = self.menu_toggle_btn.get_window()
-        if win is not None:
-            win.raise_()
+    def _build_dummy_panel(self, index, dummy_uri):
+        """A lightweight, non-functional placeholder panel for a camera
+        tile that doesn't have real drone hardware yet. Shows the same
+        overall format as the real panel (title, target IP, status) but
+        every control is disabled - nothing here can crash or interfere
+        with the real drone."""
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_size_request(340, -1)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_name("control_panel")
+        box.set_margin_top(36)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_bottom(12)
+
+        title = Gtk.Label(label=f"◆ LiteWing Drone Control - CAM{index+1}")
+        title.set_name("title_label")
+        title.set_xalign(0)
+        box.pack_start(title, False, False, 0)
+
+        uri_lbl = Gtk.Label(label=f"Target: {dummy_uri}")
+        uri_lbl.set_name("readout")
+        uri_lbl.set_xalign(0)
+        box.pack_start(uri_lbl, False, False, 0)
+
+        status_lbl = Gtk.Label(label="Not connected (dummy slot - no hardware yet)")
+        status_lbl.set_name("status_off")
+        status_lbl.set_xalign(0)
+        box.pack_start(status_lbl, False, False, 6)
+
+        note = Gtk.Label(
+            label="This is a placeholder for a future drone/camera pair.\n"
+                  "Wire up real hardware at this IP to activate it -\n"
+                  "same menu format as CAM1, just not connected yet.")
+        note.set_name("status_off")
+        note.set_xalign(0)
+        note.set_line_wrap(True)
+        box.pack_start(note, False, False, 8)
+
+        for label_text in ("Connect", "Start", "Stop", "EMERGENCY STOP"):
+            btn = Gtk.Button(label=label_text)
+            btn.set_sensitive(False)  # purely visual - dummy slots do nothing
+            box.pack_start(btn, False, False, 2)
+
+        scroll.add(box)
+        return scroll
+
+    def show_panel_for_tile(self, index):
+        """Switches the shared control-panel revealer to the given
+        tile's panel (real for tile 0, dummy for tiles 1-8). Clicking
+        the same tile's menu again while its panel is already open
+        closes the revealer instead of doing nothing."""
+        target_name = f"panel{index}"
+        currently_showing = self.control_revealer.get_reveal_child()
+        already_this_tile = self.panel_stack.get_visible_child_name() == target_name
+
+        if currently_showing and already_this_tile:
+            self.control_revealer.set_reveal_child(False)
+        else:
+            self.panel_stack.set_visible_child_name(target_name)
+            self.control_revealer.set_reveal_child(True)
 
     def _add_adjust_row(self, parent, label_text, value_label, on_minus, on_plus):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1084,7 +1405,12 @@ class DroneVideoApp(Gtk.Window):
             self.roll_lbl.set_text(f"Roll: {roll:.2f}°")
             self.pitch_lbl.set_text(f"Pitch: {pitch:.2f}°")
             self.attitude_indicator.set_attitude(roll, pitch)
-            self.video_tilt_overlay.set_attitude(roll, pitch)  # harmless if unused
+            # Only the tile actually paired with this real, connected
+            # drone gets its HUD overlay updated - NOT every tile. CAM2's
+            # camera is live but has no real drone attached (dummy panel
+            # only), so it must not mirror CAM1's attitude. As more real
+            # drones get wired up, each will drive only its own tile.
+            self.camera_tiles[REAL_DRONE_TILE_INDEX].set_attitude(roll, pitch)
             return False
         GLib.idle_add(_apply)
 
@@ -1297,7 +1623,7 @@ class DroneVideoApp(Gtk.Window):
             self.battery_lbl.set_text("Battery: --")
             self.battery_lbl.set_name("readout")
             self.attitude_indicator.set_attitude(0.0, 0.0)
-            self.video_tilt_overlay.set_attitude(0.0, 0.0)
+            self.camera_tiles[REAL_DRONE_TILE_INDEX].set_attitude(0.0, 0.0)
             return False
         GLib.idle_add(_clear)
 
@@ -1375,219 +1701,20 @@ class DroneVideoApp(Gtk.Window):
         GLib.idle_add(_apply)
 
     # ======================================================================
-    # Video (GStreamer, xvimagesink + cairooverlay)
+    # Camera grid controls
     # ======================================================================
-    def _build_video_pipeline(self):
-        # Pure C end-to-end by default - no Python runs per frame anywhere,
-        # so video throughput is decoupled from the GIL and drone-link
-        # load. If the user opted into "HUD on video", cairooverlay is
-        # spliced in instead - see VideoTiltOverlayPainter's docstring for
-        # the tradeoff this makes.
-        if self.video_hud_enabled:
-            pipe_str = (
-                f'souphttpsrc location="{CAM_URL}" is-live=true do-timestamp=true '
-                f'! multipartdemux '
-                f'! image/jpeg '
-                f'! jpegdec '
-                f'! videoconvert '
-                f'! video/x-raw,format=BGRx '
-                f'! cairooverlay name=tiltoverlay '
-                f'! videoconvert '
-                f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
-                f'! xvimagesink name=sink sync=false'
-            )
+    def toggle_cameras(self):
+        """Toggles every LIVE tile together. Empty placeholder tiles are
+        no-ops (CameraTile.toggle() checks is_live internally)."""
+        any_stopped = any(t._user_stopped for t in self.camera_tiles if t.is_live)
+        for tile in self.camera_tiles:
+            tile.toggle()
+        if any_stopped:
+            self.cam_btn.set_label("Stop Cameras")
+            self.gui_log("[VIDEO] Cameras started by user.")
         else:
-            pipe_str = (
-                f'souphttpsrc location="{CAM_URL}" is-live=true do-timestamp=true '
-                f'! multipartdemux '
-                f'! image/jpeg '
-                f'! jpegdec '
-                f'! videoconvert '
-                f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
-                f'! xvimagesink name=sink sync=false'
-            )
-        print(f"[INFO] Video pipeline (HUD-on-video={self.video_hud_enabled}):\n{pipe_str}\n")
-
-        pipeline = Gst.parse_launch(pipe_str)
-
-        if self.video_hud_enabled:
-            self._overlay_frame_size = (640, 480)  # fallback until caps-changed fires
-            tiltoverlay = pipeline.get_by_name('tiltoverlay')
-            tiltoverlay.connect('caps-changed', self._on_overlay_caps_changed)
-            tiltoverlay.connect('draw', self._on_overlay_draw)
-
-        sink = pipeline.get_by_name('sink')
-        gdk_window = self.video_area.get_window()
-        if gdk_window is None:
-            raise RuntimeError("video_area not realized yet - no X window to embed into")
-        xid = gdk_window.get_xid()
-        sink.set_window_handle(xid)
-
-        # Watchdog frame counter: a pad probe on the sink's input pad
-        # increments _frame_count for every buffer that actually arrives -
-        # the watchdog timer then knows whether frames are really flowing.
-        sink_pad = sink.get_static_pad('sink')
-        sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
-
-        bus = pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_video_bus_message)
-
-        return pipeline
-
-    def _on_frame_probe(self, pad, info):
-        self._frame_count += 1
-        return Gst.PadProbeReturn.OK
-
-    def _on_overlay_caps_changed(self, overlay, caps):
-        struct = caps.get_structure(0)
-        width = struct.get_value('width')
-        height = struct.get_value('height')
-        if width and height:
-            self._overlay_frame_size = (width, height)
-
-    def _on_overlay_draw(self, overlay, cr, timestamp, duration):
-        # GStreamer's thread, once per frame. No GTK calls here. Only
-        # active while video_hud_enabled - see the pipeline branch above.
-        width, height = self._overlay_frame_size
-        self.video_tilt_overlay.paint(cr, width, height)
-
-    def _on_video_hud_toggled(self, checkbox):
-        self.video_hud_enabled = checkbox.get_active()
-        if self.video_hud_enabled:
-            self.gui_log("[VIDEO] HUD-on-video enabled - rebuilding pipeline "
-                         "(this adds per-frame Python overhead; watch for lag).")
-        else:
-            self.gui_log("[VIDEO] HUD-on-video disabled - back to the lag-free pipeline.")
-        # Rebuild the pipeline with/without cairooverlay. This is an
-        # intentional rebuild, not a stall, so don't touch the reconnect
-        # backoff counter.
-        if self.video_running or self.video_pipeline is not None:
-            self._stop_video()
-            self._start_video_delayed()
-
-    def _on_video_area_realize(self, widget):
-        GLib.idle_add(self._start_video_delayed)
-
-    def _start_video_delayed(self):
-        if self._video_user_stopped:
-            return False  # user stopped the camera while this was queued
-        try:
-            self.video_pipeline = self._build_video_pipeline()
-            self.video_pipeline.set_state(Gst.State.PLAYING)
-            self.video_running = True
-            self.video_status_lbl.set_text(f"CAM: {CAM_URL.split('/')[2]}  //  LIVE")
-            self.video_status_lbl.set_name("status_ok")
-            self._start_watchdog()
-        except Exception as e:
-            self.video_status_lbl.set_text(f"Video failed: {e}")
-            self.video_status_lbl.set_name("status_bad")
-        return False  # one-shot idle callback
-
-    # ── Video watchdog: stall detection + auto-reconnect with backoff ────
-    def _start_watchdog(self):
-        if self._watchdog_id is None:
-            self._last_frame_count = -1
-            self._watchdog_id = GLib.timeout_add(
-                VIDEO_WATCHDOG_PERIOD_MS, self._video_watchdog_tick)
-
-    def _stop_watchdog(self):
-        if self._watchdog_id is not None:
-            GLib.source_remove(self._watchdog_id)
-            self._watchdog_id = None
-
-    def _video_watchdog_tick(self):
-        if self._video_user_stopped:
-            return True  # user stopped the camera - watch but do nothing
-        if not self.video_running:
-            return True  # reconnect logic handles restarting
-
-        if self._frame_count == self._last_frame_count:
-            # No new frames since last check -> stalled
-            self.gui_log("[VIDEO] Feed stalled - no frames in "
-                         f"{VIDEO_WATCHDOG_PERIOD_MS} ms. Reconnecting...")
-            self._attempt_video_reconnect()
-        else:
-            if self._reconnect_tries:
-                self.gui_log("[VIDEO] Feed recovered.")
-            self._reconnect_tries = 0  # progress resets the backoff
-        self._last_frame_count = self._frame_count
-        return True  # keep the timer running
-
-    def _attempt_video_reconnect(self):
-        if self._video_user_stopped:
-            return  # user explicitly stopped the camera - don't fight them
-        if self._reconnect_timeout_id is not None:
-            return  # a reconnect is already scheduled
-        self._stop_video()
-        self._reconnect_tries += 1
-        # Never give up - just cap the backoff so retries settle at a
-        # steady interval instead of stretching forever.
-        delay_s = min(2 ** (self._reconnect_tries - 1), VIDEO_RECONNECT_MAX_DELAY_S)
-        self.video_status_lbl.set_text(
-            f"Video: reconnecting (attempt {self._reconnect_tries}) in {delay_s}s... "
-            f"(or press Stop Camera)")
-        self.video_status_lbl.set_name("status_bad")
-        self._reconnect_timeout_id = GLib.timeout_add_seconds(
-            delay_s, self._reconnect_fire)
-
-    def _reconnect_fire(self):
-        # The scheduled reconnect timer fired - clear its id (it auto-
-        # removes by returning False) and start the pipeline unless the
-        # user stopped the camera while we were waiting.
-        self._reconnect_timeout_id = None
-        if not self._video_user_stopped:
-            self._start_video_delayed()
-        return False  # one-shot
-
-    def toggle_camera(self):
-        """Manual camera control - fully independent of the drone link.
-        Stop cancels any in-flight auto-reconnect; Start resets the retry
-        counter and brings the feed back up."""
-        if self._video_user_stopped:
-            # -> START
-            self._video_user_stopped = False
-            self._reconnect_tries = 0
-            self.cam_btn.set_label("Stop Camera")
-            self.gui_log("[VIDEO] Camera started by user.")
-            self.video_status_lbl.set_text(
-                f"CAM: {CAM_URL.split('/')[2]}  //  connecting...")
-            self.video_status_lbl.set_name("status_off")
-            self._start_video_delayed()
-        else:
-            # -> STOP
-            self._video_user_stopped = True
-            if self._reconnect_timeout_id is not None:
-                GLib.source_remove(self._reconnect_timeout_id)
-                self._reconnect_timeout_id = None
-            self._stop_video()
-            self.cam_btn.set_label("Start Camera")
-            self.gui_log("[VIDEO] Camera stopped by user.")
-            self.video_status_lbl.set_text("Video: stopped by user")
-            self.video_status_lbl.set_name("status_off")
-
-    def _stop_video(self):
-        if self.video_pipeline:
-            self.video_pipeline.set_state(Gst.State.NULL)
-            self.video_pipeline = None
-        self.video_running = False
-
-    def _on_video_bus_message(self, bus, message):
-        t = message.type
-        if t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            print(f"[VIDEO ERROR] {err.message}\n[DEBUG] {debug}")
-            self.gui_log(f"[VIDEO ERROR] {err.message}")
-            self._stop_video()
-            self.video_status_lbl.set_text(f"Video error: {err.message}")
-            self.video_status_lbl.set_name("status_bad")
-            self._attempt_video_reconnect()
-        elif t == Gst.MessageType.EOS:
-            self.gui_log("[VIDEO] Stream ended.")
-            self._stop_video()
-            self.video_status_lbl.set_text("Video stream ended - reconnecting...")
-            self.video_status_lbl.set_name("status_bad")
-            self._attempt_video_reconnect()
+            self.cam_btn.set_label("Start Cameras")
+            self.gui_log("[VIDEO] Cameras stopped by user.")
 
     # ======================================================================
     # Shutdown
@@ -1598,17 +1725,14 @@ class DroneVideoApp(Gtk.Window):
         self._stop_gamepad()
         self.stop_stream_evt.set()
         time.sleep(0.2)
-        self._stop_watchdog()
-        if self._reconnect_timeout_id is not None:
-            GLib.source_remove(self._reconnect_timeout_id)
-            self._reconnect_timeout_id = None
         self.stop_telemetry()
         if self.cf is not None:
             try:
                 self.cf.close_link()
             except Exception:
                 pass
-        self._stop_video()
+        for tile in self.camera_tiles:
+            tile.shutdown()
         if self._log_file is not None:
             try:
                 self._log_file.close()
@@ -1618,15 +1742,18 @@ class DroneVideoApp(Gtk.Window):
 
 
 def main():
-    global DRONE_URI, CAM_URL
-    parser = argparse.ArgumentParser(description="LiteWing drone control + ESP32-CAM video GUI")
+    global DRONE_URI, CAM_URL, CAM_URL_2
+    parser = argparse.ArgumentParser(description="LiteWing drone control + 3x3 camera grid GUI")
     parser.add_argument("--drone", default=DRONE_URI,
                         help=f"Drone link URI (default: {DRONE_URI})")
     parser.add_argument("--cam", default=CAM_URL,
-                        help=f"ESP32-CAM stream URL (default: {CAM_URL})")
+                        help=f"ESP32-CAM #1 stream URL (default: {CAM_URL})")
+    parser.add_argument("--cam2", default=CAM_URL_2,
+                        help=f"ESP32-CAM #2 stream URL (default: {CAM_URL_2})")
     args = parser.parse_args()
     DRONE_URI = args.drone
     CAM_URL = args.cam
+    CAM_URL_2 = args.cam2
 
     app = DroneVideoApp()
     Gtk.main()
