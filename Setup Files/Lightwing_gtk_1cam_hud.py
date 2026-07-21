@@ -70,12 +70,12 @@ cflib.crtp.init_drivers()
 # DRONE_URI = "udp://10.114.33.101"
 # CAM_URL = "http://10.114.33.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
 DRONE_URI = "udp://192.168.0.11"
-CAM_URL = "http://192.168.0.100:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
+CAM_URL = "http://192.168.0.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
                                               # (port 80 serves the control page only)
 # Second physical ESP32-CAM. UPDATE THIS to your real second camera's IP -
 # this is a placeholder. The other 7 tiles in the 3x3 grid intentionally
 # have no URL and never attempt a connection at all.
-CAM_URL_2 = "http://192.168.0.102:81/stream"
+CAM_URL_2 = "http://192.168.0.111:81/stream"
 
 # Which camera tile is paired with the one real, connected drone (self.cf
 # etc.). Only this tile's HUD overlay gets fed real attitude telemetry -

@@ -5,7 +5,8 @@ from cflib.crazyflie import Crazyflie
 # URI for your LiteWing drone
 # DRONE_URI = "udp://192.168.43.42"
 # DRONE_URI = "udp://10.114.33.101"
-DRONE_URI = "udp://192.168.0.11"
+#DRONE_URI = "udp://192.168.0.11"
+DRONE_URI = "udp://192.168.0.12"
 
 # Initialize CRTP drivers
 cflib.crtp.init_drivers()

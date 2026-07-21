@@ -50,13 +50,7 @@ import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
-gi.require_version('GstApp', '1.0')
-from gi.repository import Gtk, Gst, GstVideo, GstApp, GLib, Gdk
-
-import json
-import numpy as np
-import cv2
-import pyzbar.pyzbar as pyzbar
+from gi.repository import Gtk, Gst, GstVideo, GLib, Gdk
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
@@ -75,26 +69,26 @@ cflib.crtp.init_drivers()
 # ── Config - defaults, overridable from the command line ────────────────────
 # DRONE_URI = "udp://10.114.33.101"
 # CAM_URL = "http://10.114.33.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
-DRONE_URI = "udp://192.168.0.11"
+DRONE_URI = "udp://192.168.0.11:2390"
 CAM_URL = "http://192.168.0.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
                                               # (port 80 serves the control page only)
-# Second physical ESP32-CAM. UPDATE THIS to your real second camera's IP -
-# this is a placeholder. The other 7 tiles in the 3x3 grid intentionally
-# have no URL and never attempt a connection at all.
+# Second real drone + its own ESP32-CAM. MIRROR MODE: drone2 receives the
+# exact same setpoint as drone1 every 100ms (same self.setpoint dict, same
+# self.armed flag) - one joystick flies both identically. UPDATE these to
+# your real second drone/camera's IPs. The other 7 grid tiles intentionally
+# have no URL/URI and never attempt a connection at all.
+DRONE_URI_2 = "udp://192.168.0.12:2390"
 CAM_URL_2 = "http://192.168.0.111:81/stream"
 
-# Which camera tile is paired with the one real, connected drone (self.cf
-# etc.). Only this tile's HUD overlay gets fed real attitude telemetry -
-# every other tile (even ones with a live camera, like CAM2) has no real
-# drone attached yet, so their overlay must stay untouched rather than
-# mirroring this drone's roll/pitch. Update this if the real drone ever
-# moves to a different tile.
-REAL_DRONE_TILE_INDEX = 0
+# Camera tile index each real drone's telemetry/HUD feeds. drone1 -> tile 0
+# (CAM1), drone2 -> tile 1 (CAM2). Set as tile_index on each DroneLink
+# instance below (see DroneVideoApp.__init__), not a single global anymore -
+# each real drone now owns its own tile.
 
 # Manual control tuning
 ROLL_PITCH_STEP = 2.0
 MAX_TILT = 15.0
-THRUST_STEP = 1000
+THRUST_STEP = 2000
 THRUST_MIN = 100
 # cflib's send_setpoint() thrust field is a 16-bit unsigned int (0-65535 /
 # 0xFFFF). 60000 leaves a safety margin under that hard ceiling - do not
@@ -110,12 +104,6 @@ ARM_CONFIRM_TIMEOUT_S = 3         # Start -> Confirm window before reverting
 VIDEO_WATCHDOG_PERIOD_MS = 2000   # how often to check that frames are flowing
 VIDEO_RECONNECT_MAX_DELAY_S = 8   # backoff cap - retries continue forever
 LOG_DIR = os.path.expanduser("~/litewing_logs")
-
-# ── QR-based drone URI scanning ──────────────────────────────────────────────
-# Pressing Connect scans REAL_DRONE_TILE_INDEX's camera feed for a QR code
-# (see generate_drone_qr.py) instead of using a hardcoded DRONE_URI.
-QR_SCAN_INTERVAL_MS = 250   # how often to check the feed for a QR code
-QR_SCAN_TIMEOUT_S = 30      # give up and re-enable Connect after this long
 
 # ── Gamepad (Quantron QGP-1800) tuning ───────────────────────────────────────
 # Confirmed via evtest/jstest on the Jetson: DragonRise/Microntek chipset,
@@ -504,7 +492,7 @@ class CameraTile:
     the other live camera (or any of the empty ones).
     """
 
-    def __init__(self, app, index, cam_url, enable_qr_scan=False):
+    def __init__(self, app, index, cam_url):
         self.app = app  # DroneVideoApp - for gui_log() only now; HUD is per-tile
         self.index = index
         self.cam_url = cam_url
@@ -514,13 +502,6 @@ class CameraTile:
         self.running = False
         self.tilt_overlay = VideoTiltOverlayPainter() if self.is_live else None
         self._overlay_frame_size = (640, 480)
-
-        # If True, build_pipeline() adds a tee -> appsink branch alongside
-        # the normal xvimagesink display, so the app can poll frames for a
-        # QR code (used for the drone-connect flow). Off by default: every
-        # other tile's pipeline is untouched, zero extra overhead for them.
-        self.enable_qr_scan = enable_qr_scan
-        self.capture_sink = None
 
         # Per-tile HUD state - independent per camera, not a single global
         # flag anymore. Each live tile gets its own dropdown to control
@@ -595,7 +576,7 @@ class CameraTile:
 
     def build_pipeline(self):
         if self.video_hud_enabled:
-            base = (
+            pipe_str = (
                 f'souphttpsrc location="{self.cam_url}" is-live=true do-timestamp=true '
                 f'! multipartdemux '
                 f'! image/jpeg '
@@ -604,39 +585,20 @@ class CameraTile:
                 f'! video/x-raw,format=BGRx '
                 f'! cairooverlay name=tiltoverlay '
                 f'! videoconvert '
+                f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
+                f'! xvimagesink name=sink sync=false'
             )
         else:
-            base = (
+            pipe_str = (
                 f'souphttpsrc location="{self.cam_url}" is-live=true do-timestamp=true '
                 f'! multipartdemux '
                 f'! image/jpeg '
                 f'! jpegdec '
                 f'! videoconvert '
-            )
-
-        if self.enable_qr_scan:
-            # tee splits into the normal display branch (untouched) and a
-            # second branch feeding an appsink capped at the newest frame
-            # only (max-buffers=1 drop=true) - no backlog, negligible cost
-            # while nothing is actively pulling from it.
-            pipe_str = (
-                base +
-                f'! tee name=t '
-                f't. ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
-                f'     ! xvimagesink name=sink sync=false '
-                f't. ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
-                f'     ! videoconvert ! video/x-raw,format=BGR '
-                f'     ! appsink name=capture_sink emit-signals=false sync=false max-buffers=1 drop=true'
-            )
-        else:
-            pipe_str = (
-                base +
                 f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
                 f'! xvimagesink name=sink sync=false'
             )
-
-        print(f"[INFO] CAM{self.index+1} pipeline (HUD={self.video_hud_enabled}, "
-              f"QR-scan={self.enable_qr_scan}):\n{pipe_str}\n")
+        print(f"[INFO] CAM{self.index+1} pipeline (HUD={self.video_hud_enabled}):\n{pipe_str}\n")
         pipeline = Gst.parse_launch(pipe_str)
 
         if self.video_hud_enabled:
@@ -652,9 +614,6 @@ class CameraTile:
 
         sink_pad = sink.get_static_pad('sink')
         sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
-
-        if self.enable_qr_scan:
-            self.capture_sink = pipeline.get_by_name('capture_sink')
 
         bus = pipeline.get_bus()
         bus.add_signal_watch()
@@ -738,7 +697,6 @@ class CameraTile:
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
-        self.capture_sink = None
         self.running = False
 
     def toggle(self):
@@ -791,6 +749,372 @@ class CameraTile:
         self.stop()
 
 
+class DroneLink:
+    """Owns ONE drone, end to end: Crazyflie connection, telemetry,
+    keepalive thread, AND now its own arm state + its own Connect/Start/
+    Stop/E-STOP buttons. Two of these exist (drone1, drone2), each fully
+    independent.
+
+    What's genuinely per-drone and lives here: the link, connection
+    state, ARM state (this was shared/mirrored before - now it isn't),
+    telemetry values, which CameraTile's HUD this drone feeds, and this
+    drone's own panel widgets.
+
+    What's still shared across both, deliberately: `app.setpoint`. There
+    is only one physical joystick, so there is only one commanded
+    roll/pitch/yaw/thrust at any instant - but each drone's
+    persistent_stream loop now checks ITS OWN `self.armed` before
+    sending that setpoint for real (sending a zero setpoint instead if
+    not armed). That's the whole mechanism behind "joystick moves
+    whichever drone(s) are currently armed": nothing in the gamepad
+    input code needs to know which drones exist or are armed - each
+    drone's own stream loop makes that call independently, every 100ms.
+    """
+
+    def __init__(self, app, name, uri, tile_index):
+        self.app = app
+        self.name = name              # "drone1" / "drone2" - used in log lines
+        self.uri = uri
+        self.tile_index = tile_index  # which CameraTile's HUD this drone feeds
+
+        self.cf = None
+        self.connected = False
+        self.armed = False
+        self.log_conf = None
+        self.stop_stream_evt = threading.Event()
+        self.raw_attitude = {"roll": 0.0, "pitch": 0.0}
+        self.calib_offset = {"roll": 0.0, "pitch": 0.0}
+
+        # Two-step arm state (Start -> "CONFIRM ARM?" -> armed), now
+        # per-drone instead of app-global.
+        self._arm_pending = False
+        self._arm_confirm_timeout_id = None
+
+        # Widgets - attached after _build_ui constructs this drone's
+        # panel (see DroneVideoApp._build_drone_subpanel).
+        self.status_lbl = None
+        self.roll_lbl = None
+        self.pitch_lbl = None
+        self.battery_lbl = None
+        self.connect_btn = None
+        self.start_btn = None
+        self.stop_btn = None
+        self.estop_btn = None
+
+    def attach_widgets(self, status_lbl, roll_lbl, pitch_lbl, battery_lbl,
+                        connect_btn, start_btn, stop_btn, estop_btn):
+        self.status_lbl = status_lbl
+        self.roll_lbl = roll_lbl
+        self.pitch_lbl = pitch_lbl
+        self.battery_lbl = battery_lbl
+        self.connect_btn = connect_btn
+        self.start_btn = start_btn
+        self.stop_btn = stop_btn
+        self.estop_btn = estop_btn
+
+    def make_crazyflie(self):
+        cf = Crazyflie()
+        cf.connected.add_callback(self._on_connected)
+        cf.connection_failed.add_callback(self._on_connection_failed)
+        cf.disconnected.add_callback(self._on_disconnected)
+        return cf
+
+    # ── Connect (this drone only) ─────────────────────────────────────
+    def do_connect(self):
+        if self.connected:
+            self.app.gui_log(f"[{self.name}] Already connected.")
+            return
+        self.cf = self.make_crazyflie()
+        self.app.gui_log(f"[{self.name}] Connecting to {self.uri} ...")
+        if self.connect_btn is not None:
+            self.connect_btn.set_sensitive(False)
+            self.connect_btn.set_label("Connecting...")
+        self.cf.open_link(self.uri)
+
+    # ── Two-step arm (this drone only): Start -> "CONFIRM ARM?" -> armed
+    def do_start(self):
+        if not self.connected:
+            self.app.gui_log(f"[{self.name}] Not connected yet - click Connect first.")
+            return
+
+        if not self._arm_pending:
+            self._arm_pending = True
+            if self.start_btn is not None:
+                self.start_btn.set_label("CONFIRM ARM?")
+                self.start_btn.set_name("arm_confirm")
+            self._arm_confirm_timeout_id = GLib.timeout_add_seconds(
+                ARM_CONFIRM_TIMEOUT_S, self._arm_confirm_expired)
+            self.app.gui_log(f"[{self.name}] Arm requested - click again within "
+                              f"{ARM_CONFIRM_TIMEOUT_S}s to confirm.")
+            return
+
+        # Second click within the window: actually arm THIS drone. Its
+        # persistent_stream loop starts sending the real (shared)
+        # setpoint on its very next 100ms tick - the other drone is
+        # completely unaffected unless it's independently armed too.
+        self._cancel_arm_confirm()
+        self.app.gui_log(f"[{self.name}] Motors ARMED - streaming real setpoint.")
+        self.armed = True
+        if self.start_btn is not None:
+            self.start_btn.set_sensitive(False)
+        if self.stop_btn is not None:
+            self.stop_btn.set_sensitive(True)
+
+    def _arm_confirm_expired(self):
+        if self._arm_pending:
+            self.app.gui_log(f"[{self.name}] Arm request timed out - not armed.")
+            self._arm_confirm_timeout_id = None
+            self._cancel_arm_confirm()
+        return False  # one-shot
+
+    def _cancel_arm_confirm(self):
+        self._arm_pending = False
+        if self._arm_confirm_timeout_id is not None:
+            GLib.source_remove(self._arm_confirm_timeout_id)
+            self._arm_confirm_timeout_id = None
+        if self.start_btn is not None:
+            self.start_btn.set_label("Start")
+            self.start_btn.set_name("")
+
+    def do_stop(self):
+        self.app.gui_log(f"[{self.name}] Motors STOPPED - streaming zero setpoint (still connected).")
+        self.armed = False
+        if self.start_btn is not None:
+            self.start_btn.set_sensitive(True)
+        if self.stop_btn is not None:
+            self.stop_btn.set_sensitive(False)
+
+    def estop(self):
+        """Immediate motor cut for THIS drone only - disarms, cancels any
+        pending arm, sends the firmware's stop-setpoint burst. Does NOT
+        touch the shared setpoint dict or the other drone - see
+        DroneVideoApp.do_emergency_stop for the "kill everything"
+        version (spacebar)."""
+        self.armed = False
+        self._cancel_arm_confirm()
+        if self.start_btn is not None:
+            self.start_btn.set_sensitive(self.connected)
+        if self.stop_btn is not None:
+            self.stop_btn.set_sensitive(False)
+        return self.send_stop_setpoint_burst() if self.connected else False
+
+    def calibrate(self):
+        self.calib_offset["roll"] = self.raw_attitude["roll"]
+        self.calib_offset["pitch"] = self.raw_attitude["pitch"]
+        self.app.gui_log(
+            f"[{self.name}] Display calibrated - offset stored "
+            f"(raw roll={self.raw_attitude['roll']:.2f}, "
+            f"raw pitch={self.raw_attitude['pitch']:.2f}). Display-only."
+        )
+
+    def persistent_stream(self):
+        """Setpoint keepalive for THIS drone, 10Hz. Reads the app's
+        SHARED setpoint values (one joystick), but gates on THIS drone's
+        OWN armed flag - that's the entire mechanism for "joystick moves
+        whichever drone is armed"."""
+        consecutive_errors = 0
+        while self.connected and not self.stop_stream_evt.is_set():
+            try:
+                if self.armed:
+                    sp = self.app.setpoint
+                    self.cf.commander.send_setpoint(
+                        sp["roll"], sp["pitch"], sp["yaw"], sp["thrust"])
+                else:
+                    self.cf.commander.send_setpoint(0, 0, 0, 0)
+                if consecutive_errors:
+                    self.app.gui_log(f"[{self.name} STREAM] Link recovered - setpoints flowing again.")
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    self.app.gui_log(f"[{self.name} STREAM ERROR] send_setpoint failed: {e} - retrying...")
+                elif consecutive_errors == 10:
+                    self.app.gui_log(f"[{self.name} STREAM ERROR] 10 consecutive send failures - "
+                                      f"link likely down; firmware failsafe should cut motors.")
+            time.sleep(0.1)
+        self.app.gui_log(f"[{self.name} STREAM] Setpoint stream stopped.")
+
+    # ── cflib callbacks (fire on cflib's own background thread) ──────────
+    def _on_connected(self, link_uri):
+        def _apply():
+            self.connected = True
+            self.app.gui_log(f"[OK] {self.name} connected: {link_uri}")
+            if self.status_lbl is not None:
+                self.status_lbl.set_text("Connected")
+                self.status_lbl.set_name("status_ok")
+            if self.connect_btn is not None:
+                self.connect_btn.set_sensitive(False)
+                self.connect_btn.set_label("Connected")
+            if self.start_btn is not None:
+                self.start_btn.set_sensitive(True)
+            self.start_telemetry()
+            self.stop_stream_evt.clear()
+            threading.Thread(target=self.persistent_stream, daemon=True).start()
+            return False
+        GLib.idle_add(_apply)
+
+    def _on_connection_failed(self, link_uri, msg):
+        def _apply():
+            self.connected = False
+            self.app.gui_log(f"[FAIL] {self.name}: {msg}")
+            if self.status_lbl is not None:
+                self.status_lbl.set_text("Connection failed")
+                self.status_lbl.set_name("status_bad")
+            if self.connect_btn is not None:
+                self.connect_btn.set_sensitive(True)
+                self.connect_btn.set_label("Connect")
+            if self.start_btn is not None:
+                self.start_btn.set_sensitive(False)
+            return False
+        GLib.idle_add(_apply)
+
+    def _on_disconnected(self, link_uri):
+        def _apply():
+            self.connected = False
+            self.armed = False
+            self._cancel_arm_confirm()
+            self.stop_stream_evt.set()
+            self.app.gui_log(f"[INFO] {self.name} disconnected: {link_uri}")
+            if self.status_lbl is not None:
+                self.status_lbl.set_text("Disconnected")
+                self.status_lbl.set_name("status_bad")
+            if self.connect_btn is not None:
+                self.connect_btn.set_sensitive(True)
+                self.connect_btn.set_label("Connect")
+            if self.start_btn is not None:
+                self.start_btn.set_sensitive(False)
+            if self.stop_btn is not None:
+                self.stop_btn.set_sensitive(False)
+            self.stop_telemetry()
+            return False
+        GLib.idle_add(_apply)
+
+    def start_telemetry(self):
+        log_conf = LogConfig(name=f'AttitudeLog_{self.name}', period_in_ms=100)
+        try:
+            log_conf.add_variable('stabilizer.roll', 'float')
+            log_conf.add_variable('stabilizer.pitch', 'float')
+            log_conf.add_variable('pm.vbat', 'float')
+        except (KeyError, AttributeError) as e:
+            self.app.gui_log(f"[LOG ERROR] {self.name}: couldn't find expected variables: {e}")
+            return
+
+        def log_data_cb(timestamp, data, logconf):
+            roll = data.get('stabilizer.roll', 0.0)
+            pitch = data.get('stabilizer.pitch', 0.0)
+            vbat = data.get('pm.vbat', 0.0)
+            self.raw_attitude["roll"] = roll
+            self.raw_attitude["pitch"] = pitch
+            self._set_attitude_display(roll - self.calib_offset["roll"],
+                                        pitch - self.calib_offset["pitch"])
+            self._set_battery_display(vbat)
+
+        def log_error_cb(logconf, msg):
+            self.app.gui_log(f"[LOG ERROR] {self.name}: {msg}")
+
+        log_conf.data_received_cb.add_callback(log_data_cb)
+        log_conf.error_cb.add_callback(log_error_cb)
+        try:
+            self.cf.log.add_config(log_conf)
+            log_conf.start()
+        except (KeyError, AttributeError) as e:
+            self.app.gui_log(f"[WARN] {self.name}: battery variable unavailable ({e}) - "
+                              f"retrying telemetry without it.")
+            self._start_telemetry_no_battery()
+            return
+        self.log_conf = log_conf
+        self.app.gui_log(f"[{self.name}] Telemetry started - roll/pitch/battery streaming.")
+
+    def _start_telemetry_no_battery(self):
+        log_conf = LogConfig(name=f'AttitudeLogNB_{self.name}', period_in_ms=100)
+        log_conf.add_variable('stabilizer.roll', 'float')
+        log_conf.add_variable('stabilizer.pitch', 'float')
+
+        def log_data_cb(timestamp, data, logconf):
+            roll = data.get('stabilizer.roll', 0.0)
+            pitch = data.get('stabilizer.pitch', 0.0)
+            self.raw_attitude["roll"] = roll
+            self.raw_attitude["pitch"] = pitch
+            self._set_attitude_display(roll - self.calib_offset["roll"],
+                                        pitch - self.calib_offset["pitch"])
+
+        log_conf.data_received_cb.add_callback(log_data_cb)
+        log_conf.error_cb.add_callback(lambda lc, m: self.app.gui_log(f"[LOG ERROR] {self.name}: {m}"))
+        self.cf.log.add_config(log_conf)
+        log_conf.start()
+        self.log_conf = log_conf
+        self.app.gui_log(f"[{self.name}] Telemetry started - roll/pitch streaming (no battery var).")
+
+    def stop_telemetry(self):
+        if self.log_conf is not None:
+            try:
+                self.log_conf.stop()
+            except Exception:
+                pass
+            self.log_conf = None
+
+        def _clear():
+            if self.roll_lbl is not None:
+                self.roll_lbl.set_text("Roll: --")
+            if self.pitch_lbl is not None:
+                self.pitch_lbl.set_text("Pitch: --")
+            if self.battery_lbl is not None:
+                self.battery_lbl.set_text("Battery: --")
+                self.battery_lbl.set_name("readout")
+            self.app.camera_tiles[self.tile_index].set_attitude(0.0, 0.0)
+            if self.tile_index == 0:
+                self.app.attitude_indicator.set_attitude(0.0, 0.0)
+            return False
+        GLib.idle_add(_clear)
+
+    def _set_attitude_display(self, roll, pitch):
+        def _apply():
+            if self.roll_lbl is not None:
+                self.roll_lbl.set_text(f"Roll: {roll:.2f}°")
+            if self.pitch_lbl is not None:
+                self.pitch_lbl.set_text(f"Pitch: {pitch:.2f}°")
+            self.app.camera_tiles[self.tile_index].set_attitude(roll, pitch)
+            # The side-panel AttitudeIndicator widget only has room to show
+            # one drone's attitude - drone1 (tile 0) keeps driving it.
+            # Both drones' HUD overlays on their own camera tiles, and
+            # both drones' text readouts in their own panel tabs, are
+            # always independently live.
+            if self.tile_index == 0:
+                self.app.attitude_indicator.set_attitude(roll, pitch)
+            return False
+        GLib.idle_add(_apply)
+
+    def _set_battery_display(self, vbat):
+        def _apply():
+            if self.battery_lbl is not None:
+                self.battery_lbl.set_text(f"Battery: {vbat:.2f} V")
+                self.battery_lbl.set_name(
+                    "readout_warn" if vbat < BATTERY_LOW_V else "readout")
+            return False
+        GLib.idle_add(_apply)
+
+    def send_stop_setpoint_burst(self, times=3):
+        """Used by E-STOP - a few sends in case one is dropped."""
+        if self.connected and self.cf is not None:
+            try:
+                for _ in range(times):
+                    self.cf.commander.send_stop_setpoint()
+                    time.sleep(0.01)
+                return True
+            except Exception as e:
+                self.app.gui_log(f"[{self.name}] EMERGENCY STOP send failed: {e}")
+                return False
+        return False
+
+    def close_link(self):
+        self.stop_stream_evt.set()
+        if self.cf is not None:
+            try:
+                self.cf.close_link()
+            except Exception:
+                pass
+
+
 class DroneVideoApp(Gtk.Window):
 
     def __init__(self):
@@ -798,14 +1122,16 @@ class DroneVideoApp(Gtk.Window):
         self.set_default_size(1200, 760)
 
         # ── Drone/cflib state ─────────────────────────────────────────────
-        self.cf = None
-        self.connected = False
-        self.log_conf = None
-        self.stop_stream_evt = threading.Event()
-        self.armed = False
+        # Two INDEPENDENT links, each with its own connect/arm state (see
+        # DroneLink). Only the setpoint dict is shared - one joystick, one
+        # commanded roll/pitch/yaw/thrust - but each drone's own `armed`
+        # flag decides whether it actually receives that setpoint or a
+        # zero one. drone1 feeds camera tile 0 (CAM1), drone2 feeds tile 1
+        # (CAM2) - see DroneLink's tile_index.
+        self.drone1 = DroneLink(self, "drone1", DRONE_URI, tile_index=0)
+        self.drone2 = DroneLink(self, "drone2", DRONE_URI_2, tile_index=1)
+        self.drones = [self.drone1, self.drone2]
         self.setpoint = {"roll": 0.0, "pitch": 0.0, "yaw": 0, "thrust": THRUST_MIN}
-        self.raw_attitude = {"roll": 0.0, "pitch": 0.0}
-        self.calib_offset = {"roll": 0.0, "pitch": 0.0}
 
         # ── Video/pipeline state ──────────────────────────────────────────
         # 9-tile grid; only the tiles with a real cam_url actually build a
@@ -817,15 +1143,12 @@ class DroneVideoApp(Gtk.Window):
         # video pipeline. Independent of the camera grid entirely.
         self.attitude_indicator = AttitudeIndicator()
 
-        # ── Two-step arm state ────────────────────────────────────────────
-        self._arm_pending = False
-        self._arm_confirm_timeout_id = None
-
-        # ── QR-based drone URI scan state (see do_connect) ────────────────
-        self._qr_scanning = False
-        self._qr_scan_id = None
-        self._qr_scan_started_at = None
-        self._qr_detector = cv2.QRCodeDetector()
+        # ── Panel-tab tracking ──────────────────────────────────────────────
+        # Which tile's panel is currently open, so show_panel_for_tile can
+        # tell "same tile clicked again -> close" apart from "different
+        # tile clicked -> switch tabs but stay open" even though tiles 0
+        # and 1 both live inside the same outer "real" panel page.
+        self._last_panel_tile_index = None
 
         # ── Gamepad state ─────────────────────────────────────────────────
         # Latched flags, since BASE3/BASE4 are momentary on the hardware -
@@ -875,10 +1198,10 @@ class DroneVideoApp(Gtk.Window):
         self.add(overlay)
 
         # ---------------- Base layer: 3x3 camera grid ----------------
-        # CAM1 (slot 0): real camera + real drone, unchanged.
-        # CAM2 (slot 1): real camera now (2nd physical ESP32-CAM) - video
-        # only, no real drone wired up yet (its panel stays the same
-        # disabled dummy placeholder as before - see _build_dummy_panel).
+        # CAM1 (slot 0): real camera + drone1, own tab in the shared panel.
+        # CAM2 (slot 1): real camera + drone2, own SEPARATE tab in the
+        # same panel. Each tile's "Open Control Panel" opens the panel and
+        # switches straight to that drone's tab.
         # CAM3-CAM9: still fully dummy - no camera, no drone.
         cam_urls_for_grid = [CAM_URL, CAM_URL_2] + [None] * 7
 
@@ -889,7 +1212,7 @@ class DroneVideoApp(Gtk.Window):
         video_grid.set_column_spacing(2)
 
         for i, url in enumerate(cam_urls_for_grid):
-            tile = CameraTile(self, i, url, enable_qr_scan=(i == REAL_DRONE_TILE_INDEX))
+            tile = CameraTile(self, i, url)
             self.camera_tiles.append(tile)
             row, col = divmod(i, 3)
             video_grid.attach(tile.box, col, row, 1, 1)
@@ -919,41 +1242,40 @@ class DroneVideoApp(Gtk.Window):
         title.set_name("title_label")
         left.pack_start(title, False, False, 0)
 
-        self.uri_lbl = Gtk.Label(label=f"Target: {DRONE_URI}")
-        self.uri_lbl.set_xalign(0)
-        left.pack_start(self.uri_lbl, False, False, 0)
+        indep_hint = Gtk.Label(
+            label="One joystick/keyboard. Each drone is armed independently "
+                  "in its own tab below - the stick moves whichever drone(s) "
+                  "are currently armed.")
+        indep_hint.set_name("status_off")
+        indep_hint.set_xalign(0)
+        indep_hint.set_line_wrap(True)
+        left.pack_start(indep_hint, False, False, 2)
 
-        self.status_lbl = Gtk.Label(label="Not connected")
-        self.status_lbl.set_name("status_bad")
-        self.status_lbl.set_xalign(0)
-        left.pack_start(self.status_lbl, False, False, 4)
-
-        # E-STOP: prominent, always available (also bound to spacebar)
-        self.estop_btn = Gtk.Button(label="■ EMERGENCY STOP (Space)")
+        # GLOBAL E-STOP - kills BOTH drones regardless of which tab is
+        # open, always available, also bound to spacebar. Each drone tab
+        # additionally has its OWN local E-STOP that kills just that one.
+        self.estop_btn = Gtk.Button(label="■ EMERGENCY STOP BOTH (Space)")
         self.estop_btn.set_name("estop_btn")
         self.estop_btn.connect("clicked", lambda *_: self.do_emergency_stop())
         left.pack_start(self.estop_btn, False, False, 6)
 
-        self.connect_btn = Gtk.Button(label="Connect")
-        self.connect_btn.connect("clicked", lambda *_: self.do_connect())
-        left.pack_start(self.connect_btn, False, False, 4)
+        # ---- Per-drone tab switcher ----
+        tab_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tab1_btn = Gtk.Button(label="Drone 1")
+        tab1_btn.connect("clicked", lambda *_: self._switch_drone_tab(0))
+        tab2_btn = Gtk.Button(label="Drone 2")
+        tab2_btn.connect("clicked", lambda *_: self._switch_drone_tab(1))
+        tab_row.pack_start(tab1_btn, True, True, 0)
+        tab_row.pack_start(tab2_btn, True, True, 0)
+        left.pack_start(tab_row, False, False, 4)
 
-        self.qr_status_lbl = Gtk.Label(label="QR: idle")
-        self.qr_status_lbl.set_name("status_off")
-        self.qr_status_lbl.set_xalign(0)
-        self.qr_status_lbl.set_line_wrap(True)
-        left.pack_start(self.qr_status_lbl, False, False, 0)
-
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.start_btn = Gtk.Button(label="Start")
-        self.start_btn.set_sensitive(False)
-        self.start_btn.connect("clicked", lambda *_: self.do_start())
-        self.stop_btn = Gtk.Button(label="Stop")
-        self.stop_btn.set_sensitive(False)
-        self.stop_btn.connect("clicked", lambda *_: self.do_stop())
-        btn_row.pack_start(self.start_btn, True, True, 0)
-        btn_row.pack_start(self.stop_btn, True, True, 0)
-        left.pack_start(btn_row, False, False, 6)
+        self.drone_stack = Gtk.Stack()
+        self.drone_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        drone1_tab = self._build_drone_subpanel(self.drone1, "DRONE 1")
+        drone2_tab = self._build_drone_subpanel(self.drone2, "DRONE 2")
+        self.drone_stack.add_named(drone1_tab, "drone0")
+        self.drone_stack.add_named(drone2_tab, "drone1")
+        left.pack_start(self.drone_stack, False, False, 4)
 
         # Camera control - independent of the drone connection, toggles
         # BOTH live cameras together
@@ -961,42 +1283,16 @@ class DroneVideoApp(Gtk.Window):
         self.cam_btn.connect("clicked", lambda *_: self.toggle_cameras())
         left.pack_start(self.cam_btn, False, False, 4)
 
-        # Telemetry
-        telem_label = Gtk.Label(label="LIVE ATTITUDE")
-        telem_label.set_name("section_label")
-        telem_label.set_xalign(0)
-        left.pack_start(telem_label, False, False, 10)
-
-        self.roll_lbl = Gtk.Label(label="Roll: --")
-        self.roll_lbl.set_name("readout")
-        self.roll_lbl.set_xalign(0)
-        left.pack_start(self.roll_lbl, False, False, 0)
-
-        self.pitch_lbl = Gtk.Label(label="Pitch: --")
-        self.pitch_lbl.set_name("readout")
-        self.pitch_lbl.set_xalign(0)
-        left.pack_start(self.pitch_lbl, False, False, 0)
-
-        self.battery_lbl = Gtk.Label(label="Battery: --")
-        self.battery_lbl.set_name("readout")
-        self.battery_lbl.set_xalign(0)
-        left.pack_start(self.battery_lbl, False, False, 0)
-
-        calib_btn = Gtk.Button(label="Calibrate (zero display)")
-        calib_btn.connect("clicked", lambda *_: self.do_calibrate())
-        left.pack_start(calib_btn, False, False, 4)
-
-        # HUD control now lives per-camera-tile in the grid itself (see
-        # CameraTile's "HUD ▾" dropdown) instead of one global checkbox
-        # here - each camera can have HUD on or off independently.
-
-        # Manual control
-        manual_label = Gtk.Label(label="MANUAL CONTROL")
+        # ---- Manual control - SHARED: one physical stick/keyboard, one
+        # setpoint dict. Which drone(s) actually move depends on each
+        # drone's own armed state (set in its own tab above), not on
+        # anything here.
+        manual_label = Gtk.Label(label="MANUAL CONTROL (shared setpoint)")
         manual_label.set_name("section_label")
         manual_label.set_xalign(0)
         left.pack_start(manual_label, False, False, 10)
 
-        keys_hint = Gtk.Label(label="Keys: arrows=roll/pitch  W/S=thrust  Space=E-STOP")
+        keys_hint = Gtk.Label(label="Keys: arrows=roll/pitch  W/S=thrust  Space=E-STOP BOTH")
         keys_hint.set_name("status_off")
         keys_hint.set_xalign(0)
         left.pack_start(keys_hint, False, False, 0)
@@ -1039,7 +1335,7 @@ class DroneVideoApp(Gtk.Window):
         center_btn.connect("clicked", lambda *_: self.center_attitude())
         left.pack_start(center_btn, False, False, 4)
 
-        # Log
+        # Log - shared, one history for the whole app
         log_label = Gtk.Label(label="LOG")
         log_label.set_name("section_label")
         log_label.set_xalign(0)
@@ -1054,18 +1350,14 @@ class DroneVideoApp(Gtk.Window):
 
         panel_scroll.add(left)
 
-        # ---- Panel stack: tile 0 = the real, fully-functional panel
-        # built above. Tiles 1-8 = lightweight dummy placeholders (no
-        # hardware wired yet) showing a distinct drone IP each, so you
-        # can see the per-drone menu format before you have real
-        # hardware for them. Only ONE panel is ever visible in the
-        # revealer at a time; opening a tile's Menu -> Open Control
-        # Panel switches the stack to that tile's page.
+        # ---- Outer panel stack: "real" = the shared panel built above
+        # (title/E-STOP/drone tabs/manual control/log), used by tiles 0
+        # and 1. Tiles 2-8 = lightweight dummy placeholders.
         self.panel_stack = Gtk.Stack()
-        self.panel_stack.add_named(panel_scroll, "panel0")
+        self.panel_stack.add_named(panel_scroll, "real")
 
-        self.dummy_drone_uris = [f"udp://192.168.0.{20 + i}" for i in range(1, 9)]
-        for i, dummy_uri in enumerate(self.dummy_drone_uris, start=1):
+        self.dummy_drone_uris = [f"udp://192.168.0.{20 + i}" for i in range(2, 9)]
+        for i, dummy_uri in zip(range(2, 9), self.dummy_drone_uris):
             dummy_panel = self._build_dummy_panel(i, dummy_uri)
             self.panel_stack.add_named(dummy_panel, f"panel{i}")
 
@@ -1074,6 +1366,78 @@ class DroneVideoApp(Gtk.Window):
 
         self.show_all()
         self.control_revealer.set_reveal_child(False)
+
+    def _build_drone_subpanel(self, drone, heading):
+        """One drone's own tab: target URI, status, Connect/Start/Stop,
+        its own local E-STOP, telemetry readouts, and a calibrate button.
+        Fully independent of the other drone's tab - none of these
+        widgets or callbacks touch the other DroneLink."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        heading_lbl = Gtk.Label(label=f"— {heading} —")
+        heading_lbl.set_name("section_label")
+        heading_lbl.set_xalign(0)
+        box.pack_start(heading_lbl, False, False, 4)
+
+        uri_lbl = Gtk.Label(label=f"Target: {drone.uri}")
+        uri_lbl.set_xalign(0)
+        box.pack_start(uri_lbl, False, False, 0)
+
+        status_lbl = Gtk.Label(label="Not connected")
+        status_lbl.set_name("status_bad")
+        status_lbl.set_xalign(0)
+        box.pack_start(status_lbl, False, False, 4)
+
+        connect_btn = Gtk.Button(label="Connect")
+        connect_btn.connect("clicked", lambda *_: drone.do_connect())
+        box.pack_start(connect_btn, False, False, 4)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        start_btn = Gtk.Button(label="Start")
+        start_btn.set_sensitive(False)
+        start_btn.connect("clicked", lambda *_: drone.do_start())
+        stop_btn = Gtk.Button(label="Stop")
+        stop_btn.set_sensitive(False)
+        stop_btn.connect("clicked", lambda *_: drone.do_stop())
+        btn_row.pack_start(start_btn, True, True, 0)
+        btn_row.pack_start(stop_btn, True, True, 0)
+        box.pack_start(btn_row, False, False, 4)
+
+        estop_btn = Gtk.Button(label=f"■ E-STOP {heading}")
+        estop_btn.set_name("estop_btn")
+        estop_btn.connect("clicked", lambda *_: self.do_emergency_stop(drones=[drone]))
+        box.pack_start(estop_btn, False, False, 4)
+
+        telem_label = Gtk.Label(label="LIVE ATTITUDE")
+        telem_label.set_name("section_label")
+        telem_label.set_xalign(0)
+        box.pack_start(telem_label, False, False, 8)
+
+        roll_lbl = Gtk.Label(label="Roll: --")
+        roll_lbl.set_name("readout")
+        roll_lbl.set_xalign(0)
+        box.pack_start(roll_lbl, False, False, 0)
+
+        pitch_lbl = Gtk.Label(label="Pitch: --")
+        pitch_lbl.set_name("readout")
+        pitch_lbl.set_xalign(0)
+        box.pack_start(pitch_lbl, False, False, 0)
+
+        battery_lbl = Gtk.Label(label="Battery: --")
+        battery_lbl.set_name("readout")
+        battery_lbl.set_xalign(0)
+        box.pack_start(battery_lbl, False, False, 0)
+
+        calib_btn = Gtk.Button(label="Calibrate (zero display)")
+        calib_btn.connect("clicked", lambda *_: drone.calibrate())
+        box.pack_start(calib_btn, False, False, 4)
+
+        drone.attach_widgets(status_lbl, roll_lbl, pitch_lbl, battery_lbl,
+                              connect_btn, start_btn, stop_btn, estop_btn)
+        return box
+
+    def _switch_drone_tab(self, tile_index):
+        self.drone_stack.set_visible_child_name(f"drone{tile_index}")
 
     def _build_dummy_panel(self, index, dummy_uri):
         """A lightweight, non-functional placeholder panel for a camera
@@ -1125,19 +1489,29 @@ class DroneVideoApp(Gtk.Window):
         return scroll
 
     def show_panel_for_tile(self, index):
-        """Switches the shared control-panel revealer to the given
-        tile's panel (real for tile 0, dummy for tiles 1-8). Clicking
-        the same tile's menu again while its panel is already open
-        closes the revealer instead of doing nothing."""
-        target_name = f"panel{index}"
-        currently_showing = self.control_revealer.get_reveal_child()
-        already_this_tile = self.panel_stack.get_visible_child_name() == target_name
-
-        if currently_showing and already_this_tile:
-            self.control_revealer.set_reveal_child(False)
+        """Switches the control-panel revealer to the given tile's panel.
+        Tiles 0 and 1 (drone1/drone2) both live inside the same outer
+        "real" panel page, but open to DIFFERENT inner drone_stack tabs -
+        each drone gets its own independent Connect/Start/Stop/telemetry
+        tab now. Tiles 2-8 open their own dummy placeholder page.
+        Clicking the same tile's menu again while its panel is already
+        open closes the revealer instead of doing nothing."""
+        if index in (0, 1):
+            target_panel = "real"
+            self.drone_stack.set_visible_child_name(f"drone{index}")
         else:
-            self.panel_stack.set_visible_child_name(target_name)
+            target_panel = f"panel{index}"
+
+        currently_showing = self.control_revealer.get_reveal_child()
+        same_tile_as_before = (self._last_panel_tile_index == index)
+
+        if currently_showing and same_tile_as_before:
+            self.control_revealer.set_reveal_child(False)
+            self._last_panel_tile_index = None
+        else:
+            self.panel_stack.set_visible_child_name(target_panel)
             self.control_revealer.set_reveal_child(True)
+            self._last_panel_tile_index = index
 
     def _add_adjust_row(self, parent, label_text, value_label, on_minus, on_plus):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1323,18 +1697,21 @@ class DroneVideoApp(Gtk.Window):
         return True
 
     def _apply_gamepad_axis(self, axis_code, raw_value):
-        # Gated behind BOTH the existing arm state AND the gamepad's own
-        # latched flight-enable flag - CH1-4 never reach the setpoint
-        # unless the drone is armed (existing two-step-arm safety) and
-        # BASE4 has been pressed (gamepad-specific kill switch).
-        if not self.gamepad_flight_enabled or not self.armed:
+        # Gated behind BOTH the gamepad's own latched flight-enable flag
+        # AND at least one drone being armed - CH1-4 never update the
+        # shared setpoint unless BASE4 has been pressed and SOMETHING is
+        # armed to actually receive it. Which drone(s) move is decided
+        # independently by each DroneLink's own `armed` flag in its own
+        # persistent_stream loop, not here.
+        any_armed = any(d.armed for d in self.drones)
+        if not self.gamepad_flight_enabled or not any_armed:
             # Rate-limited debug log: fires once per reason, not once per
             # axis event (which would flood the log while the stick moves).
             reason = []
             if not self.gamepad_flight_enabled:
                 reason.append("gamepad_flight_enabled=False (press BASE4)")
-            if not self.armed:
-                reason.append("armed=False (Start -> CONFIRM ARM?)")
+            if not any_armed:
+                reason.append("no drone armed (arm at least one via its tab)")
             reason_str = " AND ".join(reason)
             if reason_str != self._gamepad_last_block_reason:
                 self.gui_log(f"[GAMEPAD] Stick input received but ignored - {reason_str}")
@@ -1454,254 +1831,52 @@ class DroneVideoApp(Gtk.Window):
             return False
         GLib.idle_add(_append)
 
-    def _set_attitude_display(self, roll, pitch):
-        def _apply():
-            self.roll_lbl.set_text(f"Roll: {roll:.2f}°")
-            self.pitch_lbl.set_text(f"Pitch: {pitch:.2f}°")
-            self.attitude_indicator.set_attitude(roll, pitch)
-            # Only the tile actually paired with this real, connected
-            # drone gets its HUD overlay updated - NOT every tile. CAM2's
-            # camera is live but has no real drone attached (dummy panel
-            # only), so it must not mirror CAM1's attitude. As more real
-            # drones get wired up, each will drive only its own tile.
-            self.camera_tiles[REAL_DRONE_TILE_INDEX].set_attitude(roll, pitch)
-            return False
-        GLib.idle_add(_apply)
-
-    def _set_battery_display(self, vbat):
-        def _apply():
-            self.battery_lbl.set_text(f"Battery: {vbat:.2f} V")
-            self.battery_lbl.set_name(
-                "readout_warn" if vbat < BATTERY_LOW_V else "readout")
-            return False
-        GLib.idle_add(_apply)
-
     def _update_cmd_display(self):
         self.thrust_lbl.set_text(f"{self.setpoint['thrust']}")
         self.pitch_cmd_lbl.set_text(f"{self.setpoint['pitch']:.1f}°")
         self.roll_cmd_lbl.set_text(f"{self.setpoint['roll']:.1f}°")
 
     # ======================================================================
-    # cflib / drone logic
+    # cflib / drone logic — each drone is now independent (see DroneLink:
+    # do_connect/do_start/do_stop/estop/calibrate all live there and are
+    # wired directly to that drone's own tab widgets). This class only
+    # keeps the GLOBAL E-STOP (kills both, used by the top-of-panel button
+    # and spacebar) and the shared setpoint adjusters (one joystick).
     # ======================================================================
-    def make_crazyflie(self):
-        new_cf = Crazyflie()
-        new_cf.connected.add_callback(self._on_connected)
-        new_cf.connection_failed.add_callback(self._on_connection_failed)
-        new_cf.disconnected.add_callback(self._on_disconnected)
-        return new_cf
+    def do_emergency_stop(self, drones=None):
+        """Immediate motor cut. With no argument (spacebar / the top
+        "EMERGENCY STOP BOTH" button), kills every connected drone AND
+        resets the shared setpoint + disables gamepad flight globally -
+        the "something is wrong, stop everything now" button.
 
-    def do_connect(self):
-        if self.connected:
-            self.gui_log("Already connected.")
-            return
+        Called with drones=[one_drone] (from that drone's own tab), it
+        kills ONLY that drone - the shared setpoint dict is left alone,
+        since the other drone may still be armed and flying on it."""
+        targets = drones if drones is not None else self.drones
+        is_global = drones is None
 
-        if self._qr_scanning:
-            # Second press while scanning = cancel, matching the button's
-            # "click to cancel" label rather than silently doing nothing.
-            self._cancel_qr_scan("[QR] Scan cancelled by user.")
-            return
+        if is_global:
+            self.gamepad_flight_enabled = False
+            self.gamepad_status_lbl.set_text("Gamepad flight: DISABLED")
+            self.gamepad_status_lbl.set_name("status_bad")
+            # Reset commanded values so a re-arm doesn't jump straight
+            # back - safe here because a global stop means nothing should
+            # still be reading this setpoint as "real" a moment later.
+            self.setpoint["roll"] = 0.0
+            self.setpoint["pitch"] = 0.0
+            self.setpoint["thrust"] = THRUST_MIN
+            self._update_cmd_display()
 
-        tile = self.camera_tiles[REAL_DRONE_TILE_INDEX]
-        if not tile.is_live or tile.capture_sink is None:
-            self.gui_log(f"[QR] CAM{REAL_DRONE_TILE_INDEX+1} isn't live yet - "
-                         f"start the cameras before connecting.")
-            return
+        any_sent = False
+        for d in targets:
+            if d.estop():
+                any_sent = True
 
-        self.gui_log("[QR] Scanning for the drone's QR code...")
-        self.qr_status_lbl.set_text("QR: scanning...")
-        self.qr_status_lbl.set_name("status_bad")
-        self.connect_btn.set_label("Scanning QR (click to cancel)")
-        self._qr_scanning = True
-        self._qr_scan_started_at = time.time()
-        self._qr_scan_id = GLib.timeout_add(QR_SCAN_INTERVAL_MS, self._qr_scan_tick)
-
-    def _cancel_qr_scan(self, log_msg):
-        self._qr_scanning = False
-        if self._qr_scan_id is not None:
-            GLib.source_remove(self._qr_scan_id)
-            self._qr_scan_id = None
-        self.gui_log(log_msg)
-        self.qr_status_lbl.set_text("QR: idle")
-        self.qr_status_lbl.set_name("status_off")
-        self.connect_btn.set_label("Connect")
-        self.connect_btn.set_sensitive(True)
-
-    def _qr_scan_tick(self):
-        """GLib timeout on the GTK main thread - not a per-video-frame
-        callback on GStreamer's own thread, same throttling reasoning as
-        the HUD overlay elsewhere in this app."""
-        if not self._qr_scanning:
-            return False
-
-        tile = self.camera_tiles[REAL_DRONE_TILE_INDEX]
-        if tile.capture_sink is None:
-            self._cancel_qr_scan(f"[QR] CAM{REAL_DRONE_TILE_INDEX+1} feed dropped - scan aborted.")
-            return False
-
-        if time.time() - self._qr_scan_started_at > QR_SCAN_TIMEOUT_S:
-            self._cancel_qr_scan(
-                f"[QR] No QR code found within {QR_SCAN_TIMEOUT_S}s - click Connect to retry.")
-            return False
-
-        sample = tile.capture_sink.try_pull_sample(0)  # non-blocking
-        if sample is None:
-            return True  # nothing new yet, keep polling
-
-        img = self._sample_to_bgr_ndarray(sample)
-        if img is None:
-            return True
-
-        drone_uri = self._decode_drone_qr(img)
-        if drone_uri:
-            self._qr_scanning = False
-            self._qr_scan_id = None
-            self.gui_log(f"[QR] Decoded drone URI: {drone_uri}")
-            self.qr_status_lbl.set_text(f"QR: got {drone_uri}")
-            self.qr_status_lbl.set_name("status_ok")
-            self._start_drone_connection(drone_uri)
-            return False  # stop scanning - we're done
-
-        return True  # keep scanning
-
-    def _decode_drone_qr(self, img_bgr):
-        """Reads a QR code and returns the drone URI, or None if nothing
-        usable was found. Accepts either a raw URI string (this app's
-        generate_drone_qr.py) or a JSON payload with a "drone_uri" key
-        (compatible with the combined drone+camera QR format), so either
-        kind of QR code works here."""
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-        text = None
-        try:
-            results = pyzbar.decode(gray)
-            if results:
-                text = results[0].data.decode('utf-8', errors='replace')
-        except Exception as e:
-            self.gui_log(f"[QR WARN] pyzbar failed ({e}); falling back to cv2 only")
-
-        if text is None:
-            data, points, _ = self._qr_detector.detectAndDecode(img_bgr)
-            text = data if data else None
-
-        if not text:
-            return None
-
-        try:
-            obj = json.loads(text)
-            return obj.get("drone_uri")
-        except (json.JSONDecodeError, AttributeError):
-            return text.strip()
-
-    def _sample_to_bgr_ndarray(self, sample):
-        """Convert a GstSample (video/x-raw, format=BGR) into a numpy array."""
-        buf = sample.get_buffer()
-        caps = sample.get_caps()
-        struct = caps.get_structure(0)
-        width = struct.get_value('width')
-        height = struct.get_value('height')
-
-        ok, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            return None
-        try:
-            arr = np.frombuffer(mapinfo.data, dtype=np.uint8)
-            expected = width * height * 3
-            if arr.size < expected:
-                return None
-            arr = arr[:expected].reshape((height, width, 3))
-            return arr.copy()  # copy out before unmapping
-        finally:
-            buf.unmap(mapinfo)
-
-    def _start_drone_connection(self, drone_uri):
-        global DRONE_URI
-        DRONE_URI = drone_uri
-        self.uri_lbl.set_text(f"Target: {DRONE_URI}")
-        self.cf = self.make_crazyflie()
-        self.gui_log(f"Connecting to drone at {DRONE_URI} ...")
-        self.connect_btn.set_sensitive(False)
-        self.connect_btn.set_label("Connecting...")
-        self.cf.open_link(DRONE_URI)
-
-    # ── Two-step arm: Start -> "CONFIRM ARM?" (3s window) -> armed ───────
-    def do_start(self):
-        if not self.connected:
-            self.gui_log("Not connected yet - click Connect first.")
-            return
-
-        if not self._arm_pending:
-            self._arm_pending = True
-            self.start_btn.set_label("CONFIRM ARM?")
-            self.start_btn.set_name("arm_confirm")
-            self._arm_confirm_timeout_id = GLib.timeout_add_seconds(
-                ARM_CONFIRM_TIMEOUT_S, self._arm_confirm_expired)
-            self.gui_log(f"Arm requested - click again within "
-                         f"{ARM_CONFIRM_TIMEOUT_S}s to confirm.")
-            return
-
-        # Second click within the window: actually arm
-        self._cancel_arm_confirm()
-        self.gui_log("Motors ARMED - streaming real setpoint.")
-        self.armed = True
-        self.start_btn.set_sensitive(False)
-        self.stop_btn.set_sensitive(True)
-
-    def _arm_confirm_expired(self):
-        if self._arm_pending:
-            self.gui_log("Arm request timed out - not armed.")
-            # This source auto-removes when we return False - clear the id
-            # first so _cancel_arm_confirm doesn't source_remove it again
-            # (which would emit a 'Source ID not found' warning).
-            self._arm_confirm_timeout_id = None
-            self._cancel_arm_confirm()
-        return False  # one-shot
-
-    def _cancel_arm_confirm(self):
-        self._arm_pending = False
-        if self._arm_confirm_timeout_id is not None:
-            GLib.source_remove(self._arm_confirm_timeout_id)
-            self._arm_confirm_timeout_id = None
-        self.start_btn.set_label("Start")
-        self.start_btn.set_name("")
-
-    def do_stop(self):
-        self.gui_log("Motors STOPPED - streaming zero setpoint (still connected).")
-        self.armed = False
-        self.gamepad_flight_enabled = False
-        self.gamepad_status_lbl.set_text("Gamepad flight: DISABLED")
-        self.gamepad_status_lbl.set_name("status_bad")
-        self.start_btn.set_sensitive(True)
-        self.stop_btn.set_sensitive(False)
-
-    def do_emergency_stop(self):
-        """Immediate motor cut - stronger than Stop. Sends the firmware's
-        stop-setpoint (motors off now), disarms, cancels any pending arm.
-        Safe to press at any time, connected or not."""
-        self.armed = False
-        self.gamepad_flight_enabled = False
-        self.gamepad_status_lbl.set_text("Gamepad flight: DISABLED")
-        self.gamepad_status_lbl.set_name("status_bad")
-        self._cancel_arm_confirm()
-        self.start_btn.set_sensitive(self.connected)
-        self.stop_btn.set_sensitive(False)
-        # Reset commanded values so a re-arm doesn't jump straight back
-        self.setpoint["roll"] = 0.0
-        self.setpoint["pitch"] = 0.0
-        self.setpoint["thrust"] = THRUST_MIN
-        self._update_cmd_display()
-
-        if self.connected and self.cf is not None:
-            try:
-                for _ in range(3):  # a few sends in case one is dropped
-                    self.cf.commander.send_stop_setpoint()
-                    time.sleep(0.01)
-                self.gui_log("*** EMERGENCY STOP - stop-setpoint sent, motors cut. ***")
-            except Exception as e:
-                self.gui_log(f"*** EMERGENCY STOP - send failed ({e}) - "
-                             f"link may be down; firmware failsafe should cut motors. ***")
+        names = ", ".join(d.name for d in targets)
+        if any_sent:
+            self.gui_log(f"*** EMERGENCY STOP ({names}) - stop-setpoint sent, motors cut. ***")
         else:
-            self.gui_log("*** EMERGENCY STOP pressed (not connected - nothing to send). ***")
+            self.gui_log(f"*** EMERGENCY STOP pressed ({names}) - not connected, nothing sent. ***")
 
     def adjust_roll(self, delta):
         self.setpoint["roll"] = max(-MAX_TILT, min(MAX_TILT, self.setpoint["roll"] + delta))
@@ -1720,164 +1895,6 @@ class DroneVideoApp(Gtk.Window):
         self.setpoint["pitch"] = 0.0
         self.gui_log("Roll/pitch centered to level.")
         self._update_cmd_display()
-
-    def do_calibrate(self):
-        self.calib_offset["roll"] = self.raw_attitude["roll"]
-        self.calib_offset["pitch"] = self.raw_attitude["pitch"]
-        self.gui_log(
-            f"Display calibrated - offset stored (raw roll={self.raw_attitude['roll']:.2f}, "
-            f"raw pitch={self.raw_attitude['pitch']:.2f}). Display-only."
-        )
-
-    def start_telemetry(self):
-        log_conf = LogConfig(name='AttitudeLog', period_in_ms=100)
-        try:
-            log_conf.add_variable('stabilizer.roll', 'float')
-            log_conf.add_variable('stabilizer.pitch', 'float')
-            log_conf.add_variable('pm.vbat', 'float')   # battery voltage
-        except (KeyError, AttributeError) as e:
-            self.gui_log(f"[LOG ERROR] Couldn't find expected variables: {e}")
-            return
-
-        def log_data_cb(timestamp, data, logconf):
-            roll = data.get('stabilizer.roll', 0.0)
-            pitch = data.get('stabilizer.pitch', 0.0)
-            vbat = data.get('pm.vbat', 0.0)
-            self.raw_attitude["roll"] = roll
-            self.raw_attitude["pitch"] = pitch
-            self._set_attitude_display(roll - self.calib_offset["roll"],
-                                        pitch - self.calib_offset["pitch"])
-            self._set_battery_display(vbat)
-
-        def log_error_cb(logconf, msg):
-            self.gui_log(f"[LOG ERROR] {msg}")
-
-        log_conf.data_received_cb.add_callback(log_data_cb)
-        log_conf.error_cb.add_callback(log_error_cb)
-        try:
-            self.cf.log.add_config(log_conf)
-            log_conf.start()
-        except (KeyError, AttributeError) as e:
-            # pm.vbat missing from this firmware's TOC - fall back without it
-            self.gui_log(f"[WARN] Battery variable unavailable ({e}) - "
-                         f"retrying telemetry without it.")
-            self._start_telemetry_no_battery()
-            return
-        self.log_conf = log_conf
-        self.gui_log("Telemetry started - roll/pitch/battery streaming.")
-
-    def _start_telemetry_no_battery(self):
-        log_conf = LogConfig(name='AttitudeLogNB', period_in_ms=100)
-        log_conf.add_variable('stabilizer.roll', 'float')
-        log_conf.add_variable('stabilizer.pitch', 'float')
-
-        def log_data_cb(timestamp, data, logconf):
-            roll = data.get('stabilizer.roll', 0.0)
-            pitch = data.get('stabilizer.pitch', 0.0)
-            self.raw_attitude["roll"] = roll
-            self.raw_attitude["pitch"] = pitch
-            self._set_attitude_display(roll - self.calib_offset["roll"],
-                                        pitch - self.calib_offset["pitch"])
-
-        log_conf.data_received_cb.add_callback(log_data_cb)
-        log_conf.error_cb.add_callback(lambda lc, m: self.gui_log(f"[LOG ERROR] {m}"))
-        self.cf.log.add_config(log_conf)
-        log_conf.start()
-        self.log_conf = log_conf
-        self.gui_log("Telemetry started - roll/pitch streaming (no battery var).")
-
-    def stop_telemetry(self):
-        if self.log_conf is not None:
-            try:
-                self.log_conf.stop()
-            except Exception:
-                pass
-            self.log_conf = None
-
-        def _clear():
-            self.roll_lbl.set_text("Roll: --")
-            self.pitch_lbl.set_text("Pitch: --")
-            self.battery_lbl.set_text("Battery: --")
-            self.battery_lbl.set_name("readout")
-            self.attitude_indicator.set_attitude(0.0, 0.0)
-            self.camera_tiles[REAL_DRONE_TILE_INDEX].set_attitude(0.0, 0.0)
-            return False
-        GLib.idle_add(_clear)
-
-    def persistent_stream(self):
-        """Setpoint keepalive - runs on its own thread, hardened so a link
-        error can never make it die silently: failures surface in the log
-        and the loop keeps trying while connected (the firmware's own
-        no-setpoint failsafe is the backstop if the link is truly gone)."""
-        consecutive_errors = 0
-        while self.connected and not self.stop_stream_evt.is_set():
-            try:
-                if self.armed:
-                    self.cf.commander.send_setpoint(
-                        self.setpoint["roll"], self.setpoint["pitch"],
-                        self.setpoint["yaw"], self.setpoint["thrust"]
-                    )
-                else:
-                    self.cf.commander.send_setpoint(0, 0, 0, 0)
-                if consecutive_errors:
-                    self.gui_log("[STREAM] Link recovered - setpoints flowing again.")
-                consecutive_errors = 0
-            except Exception as e:
-                consecutive_errors += 1
-                if consecutive_errors == 1:  # log the first, not a flood
-                    self.gui_log(f"[STREAM ERROR] send_setpoint failed: {e} - retrying...")
-                elif consecutive_errors == 10:
-                    self.gui_log("[STREAM ERROR] 10 consecutive send failures - "
-                                 "link likely down; firmware failsafe should cut motors.")
-            time.sleep(0.1)
-        self.gui_log("[STREAM] Setpoint stream stopped.")
-
-    # ── cflib callbacks (fire on cflib's own background thread) ──────────
-    def _on_connected(self, link_uri):
-        def _apply():
-            self.connected = True
-            self.gui_log(f"[OK] Connected: {link_uri}")
-            self.status_lbl.set_text("Connected")
-            self.status_lbl.set_name("status_ok")
-            self.connect_btn.set_sensitive(False)
-            self.connect_btn.set_label("Connected")
-            self.start_btn.set_sensitive(True)
-            self.start_telemetry()
-            self.stop_stream_evt.clear()
-            threading.Thread(target=self.persistent_stream, daemon=True).start()
-            return False
-        GLib.idle_add(_apply)
-
-    def _on_connection_failed(self, link_uri, msg):
-        def _apply():
-            self.connected = False
-            self.gui_log(f"[FAIL] {msg}")
-            self.status_lbl.set_text("Connection failed")
-            self.status_lbl.set_name("status_bad")
-            self.connect_btn.set_sensitive(True)
-            self.connect_btn.set_label("Connect")
-            self.start_btn.set_sensitive(False)
-            return False
-        GLib.idle_add(_apply)
-
-    def _on_disconnected(self, link_uri):
-        def _apply():
-            self.connected = False
-            self.armed = False
-            self._cancel_arm_confirm()
-            self.stop_stream_evt.set()
-            self.gui_log(f"[INFO] Disconnected: {link_uri}")
-            self.status_lbl.set_text("Disconnected")
-            self.status_lbl.set_name("status_bad")
-            self.connect_btn.set_sensitive(True)
-            self.connect_btn.set_label("Connect")
-            self.start_btn.set_sensitive(False)
-            self.stop_btn.set_sensitive(False)
-            self.qr_status_lbl.set_text("QR: idle")
-            self.qr_status_lbl.set_name("status_off")
-            self.stop_telemetry()
-            return False
-        GLib.idle_add(_apply)
 
     # ======================================================================
     # Camera grid controls
@@ -1899,20 +1916,16 @@ class DroneVideoApp(Gtk.Window):
     # Shutdown
     # ======================================================================
     def _on_destroy(self, *args):
-        self.armed = False
         self.gamepad_flight_enabled = False
         self._stop_gamepad()
-        if self._qr_scan_id is not None:
-            GLib.source_remove(self._qr_scan_id)
-            self._qr_scan_id = None
-        self.stop_stream_evt.set()
+        for d in self.drones:
+            d.armed = False
+            d._cancel_arm_confirm()
+            d.stop_stream_evt.set()
         time.sleep(0.2)
-        self.stop_telemetry()
-        if self.cf is not None:
-            try:
-                self.cf.close_link()
-            except Exception:
-                pass
+        for d in self.drones:
+            d.stop_telemetry()
+            d.close_link()
         for tile in self.camera_tiles:
             tile.shutdown()
         if self._log_file is not None:
@@ -1924,16 +1937,19 @@ class DroneVideoApp(Gtk.Window):
 
 
 def main():
-    global DRONE_URI, CAM_URL, CAM_URL_2
-    parser = argparse.ArgumentParser(description="LiteWing drone control + 3x3 camera grid GUI")
+    global DRONE_URI, DRONE_URI_2, CAM_URL, CAM_URL_2
+    parser = argparse.ArgumentParser(description="LiteWing 2-drone mirror control + 3x3 camera grid GUI")
     parser.add_argument("--drone", default=DRONE_URI,
-                        help=f"Drone link URI (default: {DRONE_URI})")
+                        help=f"Drone 1 link URI (default: {DRONE_URI})")
+    parser.add_argument("--drone2", default=DRONE_URI_2,
+                        help=f"Drone 2 link URI (default: {DRONE_URI_2})")
     parser.add_argument("--cam", default=CAM_URL,
                         help=f"ESP32-CAM #1 stream URL (default: {CAM_URL})")
     parser.add_argument("--cam2", default=CAM_URL_2,
                         help=f"ESP32-CAM #2 stream URL (default: {CAM_URL_2})")
     args = parser.parse_args()
     DRONE_URI = args.drone
+    DRONE_URI_2 = args.drone2
     CAM_URL = args.cam
     CAM_URL_2 = args.cam2
 
