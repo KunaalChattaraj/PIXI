@@ -21,7 +21,7 @@ Gst.init(None)
 
 # ── ESP32 CAM IP — Change this to your actual IP ──────────────────────────────
 #CAM1_URL = "http://10.129.231.194:81/stream"
-CAM1_URL = "http://192.168.0.100:81/stream"
+CAM1_URL = "http://192.168.0.110:81/stream"
 
 
 # ── CSS Styling ───────────────────────────────────────────────────────────────
