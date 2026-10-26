@@ -1,0 +1,235 @@
+import time
+import threading
+import tkinter as tk
+from tkinter import scrolledtext
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
+
+# Update this to match your drone's current IP
+DRONE_URI = "udp://10.228.47.101"
+
+cflib.crtp.init_drivers()
+
+state = {
+    "cf": None,
+    "connected": False,
+    "log_conf": None,
+}
+stop_stream = threading.Event()
+armed = {"value": False}
+setpoint = {"roll": 0.0, "pitch": 0.0, "yaw": 0, "thrust": 10000}
+
+
+def log(msg):
+    """Thread-safe way to write into the GUI log box from a background thread."""
+    log_box.after(0, lambda: (log_box.insert(tk.END, msg + "\n"), log_box.see(tk.END)))
+
+
+def set_attitude_display(roll, pitch):
+    """Thread-safe update of the roll/pitch readout - log data arrives on
+    a background thread, so GUI updates must be scheduled via .after()."""
+    log_box.after(0, lambda: (roll_var.set(f"{roll:.2f}°"), pitch_var.set(f"{pitch:.2f}°")))
+
+
+def make_crazyflie():
+    """A fresh Crazyflie() must be created for every connection attempt -
+    cflib starts an internal background thread on open_link(), and a
+    Python thread object can only ever be started once, even after it
+    finishes. Reusing one instance across multiple Connect clicks causes
+    'threads can only be started once'."""
+    new_cf = Crazyflie()
+    new_cf.connected.add_callback(on_connected)
+    new_cf.connection_failed.add_callback(on_connection_failed)
+    new_cf.disconnected.add_callback(on_disconnected)
+    return new_cf
+
+
+def start_telemetry():
+    """Subscribes to the drone's internal roll/pitch estimate and streams
+    it back to the PC at 10Hz."""
+    log_conf = LogConfig(name='AttitudeLog', period_in_ms=100)
+    try:
+        log_conf.add_variable('stabilizer.roll', 'float')
+        log_conf.add_variable('stabilizer.pitch', 'float')
+    except (KeyError, AttributeError) as e:
+        log(f"[LOG ERROR] Couldn't find expected variables: {e}")
+        log("Available log groups reported by this firmware's TOC:")
+        try:
+            groups = sorted(set(state["cf"].log.toc.toc.keys()))
+            for g in groups[:25]:
+                log(f"  - {g}")
+        except Exception:
+            pass
+        return
+
+    def log_data_cb(timestamp, data, logconf):
+        roll = data.get('stabilizer.roll', 0.0)
+        pitch = data.get('stabilizer.pitch', 0.0)
+        set_attitude_display(roll, pitch)
+
+    def log_error_cb(logconf, msg):
+        log(f"[LOG ERROR] {msg}")
+
+    log_conf.data_received_cb.add_callback(log_data_cb)
+    log_conf.error_cb.add_callback(log_error_cb)
+    state["cf"].log.add_config(log_conf)
+    log_conf.start()
+    state["log_conf"] = log_conf
+    log("Telemetry started - live roll/pitch now streaming.")
+
+
+def stop_telemetry():
+    if state["log_conf"] is not None:
+        try:
+            state["log_conf"].stop()
+        except Exception:
+            pass
+        state["log_conf"] = None
+    roll_var.set("--")
+    pitch_var.set("--")
+
+
+def persistent_stream():
+    """Runs for the ENTIRE connected session, not just while 'Started'.
+    Continuously sends a setpoint every 100ms - zero when idle, the real
+    values when armed. Sending continuously (even zeros) keeps the
+    outbound UDP path alive through the hotspot/router's NAT translation,
+    so return traffic like telemetry keeps flowing, and it keeps the
+    firmware's safety watchdog satisfied at all times rather than only
+    while motors are actively spinning."""
+    cf = state["cf"]
+    while state["connected"] and not stop_stream.is_set():
+        if armed["value"]:
+            cf.commander.send_setpoint(setpoint["roll"], setpoint["pitch"], setpoint["yaw"], setpoint["thrust"])
+        else:
+            cf.commander.send_setpoint(0, 0, 0, 0)
+        time.sleep(0.1)
+
+
+def on_connected(link_uri):
+    state["connected"] = True
+    log(f"[OK] Connected: {link_uri}")
+    status_var.set("Connected")
+    status_label.config(fg="#2e7d32")
+    connect_btn.config(state=tk.DISABLED, text="Connected")
+    start_btn.config(state=tk.NORMAL)
+    start_telemetry()
+    stop_stream.clear()
+    threading.Thread(target=persistent_stream, daemon=True).start()
+
+
+def on_connection_failed(link_uri, msg):
+    state["connected"] = False
+    log(f"[FAIL] {msg}")
+    status_var.set("Connection failed")
+    status_label.config(fg="#c62828")
+    connect_btn.config(state=tk.NORMAL, text="Connect")
+    start_btn.config(state=tk.DISABLED)
+
+
+def on_disconnected(link_uri):
+    state["connected"] = False
+    armed["value"] = False
+    stop_stream.set()
+    log(f"[INFO] Disconnected: {link_uri}")
+    status_var.set("Disconnected")
+    status_label.config(fg="#c62828")
+    connect_btn.config(state=tk.NORMAL, text="Connect")
+    start_btn.config(state=tk.DISABLED)
+    stop_btn.config(state=tk.DISABLED)
+    stop_telemetry()
+
+
+def do_connect():
+    if state["connected"]:
+        log("Already connected.")
+        return
+    state["cf"] = make_crazyflie()
+    log("Connecting to drone...")
+    connect_btn.config(state=tk.DISABLED, text="Connecting...")
+    state["cf"].open_link(DRONE_URI)
+
+
+def do_start():
+    if not state["connected"]:
+        log("Not connected yet - click Connect first.")
+        return
+    log("Motors ARMED - streaming real setpoint.")
+    armed["value"] = True
+    start_btn.config(state=tk.DISABLED)
+    stop_btn.config(state=tk.NORMAL)
+
+
+def do_stop():
+    log("Motors STOPPED - streaming zero setpoint (still connected).")
+    armed["value"] = False
+    start_btn.config(state=tk.NORMAL)
+    stop_btn.config(state=tk.DISABLED)
+
+
+def on_close():
+    armed["value"] = False
+    stop_stream.set()
+    time.sleep(0.2)
+    stop_telemetry()
+    if state["cf"] is not None:
+        try:
+            state["cf"].close_link()
+        except Exception:
+            pass
+    root.destroy()
+
+
+# --- GUI layout ---
+root = tk.Tk()
+root.title("LiteWing Control Panel")
+root.geometry("420x540")
+
+title_label = tk.Label(root, text="LiteWing Drone Control", font=("Segoe UI", 14, "bold"))
+title_label.pack(pady=8)
+
+uri_label = tk.Label(root, text=f"Target: {DRONE_URI}", font=("Segoe UI", 9), fg="#555555")
+uri_label.pack()
+
+status_var = tk.StringVar(value="Not connected")
+status_label = tk.Label(root, textvariable=status_var, font=("Segoe UI", 10, "bold"), fg="#c62828")
+status_label.pack(pady=4)
+
+connect_btn = tk.Button(root, text="Connect", width=14, height=1, bg="#1976D2", fg="white",
+                         font=("Segoe UI", 10, "bold"), command=do_connect)
+connect_btn.pack(pady=6)
+
+btn_frame = tk.Frame(root)
+btn_frame.pack(pady=8)
+
+start_btn = tk.Button(btn_frame, text="Start", width=12, height=2, bg="#4CAF50", fg="white",
+                       font=("Segoe UI", 11, "bold"), command=do_start, state=tk.DISABLED)
+start_btn.grid(row=0, column=0, padx=10)
+
+stop_btn = tk.Button(btn_frame, text="Stop", width=12, height=2, bg="#E53935", fg="white",
+                      font=("Segoe UI", 11, "bold"), command=do_stop, state=tk.DISABLED)
+stop_btn.grid(row=0, column=1, padx=10)
+
+# --- Telemetry section ---
+telem_frame = tk.LabelFrame(root, text="Live Attitude", font=("Segoe UI", 10, "bold"), padx=10, pady=10)
+telem_frame.pack(pady=10, padx=10, fill="x")
+
+roll_var = tk.StringVar(value="--")
+pitch_var = tk.StringVar(value="--")
+
+roll_row = tk.Frame(telem_frame)
+roll_row.pack(fill="x")
+tk.Label(roll_row, text="Roll:", font=("Segoe UI", 11), width=8, anchor="w").pack(side="left")
+tk.Label(roll_row, textvariable=roll_var, font=("Consolas", 12, "bold"), fg="#1976D2").pack(side="left")
+
+pitch_row = tk.Frame(telem_frame)
+pitch_row.pack(fill="x")
+tk.Label(pitch_row, text="Pitch:", font=("Segoe UI", 11), width=8, anchor="w").pack(side="left")
+tk.Label(pitch_row, textvariable=pitch_var, font=("Consolas", 12, "bold"), fg="#1976D2").pack(side="left")
+
+log_box = scrolledtext.ScrolledText(root, width=48, height=12, font=("Consolas", 9))
+log_box.pack(pady=10, padx=10)
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()

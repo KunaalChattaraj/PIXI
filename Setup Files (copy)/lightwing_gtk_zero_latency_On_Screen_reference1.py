@@ -1,0 +1,1052 @@
+#!/usr/bin/env python3
+"""
+LiteWing Drone Control + ESP32-CAM Video — GTK + GStreamer
+============================================================
+Drone control via cflib, video via xvimagesink rendered directly into a GTK
+DrawingArea through set_window_handle(xid). GStreamer hands frames straight
+to the X server; no per-frame Python conversion, no appsink.
+
+The tilt reference (horizon, pitch ladder, roll arc) is drawn INSIDE the
+GStreamer pipeline via cairooverlay - baked into the video pixels before
+they reach xvimagesink, which keeps it compatible with Xv's hardware
+overlay (GTK-widget-layer transparency conflicts with it).
+
+Threads/contexts:
+  1. GTK/GLib main loop      - GUI, GStreamer bus messages, watchdog timer
+  2. cflib background thread - telemetry + connection callbacks
+                                (marshaled to GUI via GLib.idle_add)
+  3. persistent_stream thread - sends a setpoint every 100ms (keepalive)
+  4. GStreamer streaming thread - pipeline + per-frame cairooverlay draw
+
+Safety features:
+  - E-STOP button + spacebar: sends stop-setpoint immediately (motors cut)
+  - Two-step arm: Start -> "CONFIRM ARM?" within 3s -> armed
+  - Battery voltage monitoring with low-voltage warning
+  - persistent_stream hardened: link errors surface in the log, never die silently
+  - Video watchdog: detects a stalled camera feed, auto-reconnects with backoff
+
+Usage:
+  python3 lightwing_gtk_zero_latency.py \
+      --drone udp://10.114.33.101 \
+      --cam   http://10.114.33.110:81/stream
+  (both optional - defaults below)
+"""
+
+import os
+os.environ['GDK_BACKEND'] = 'x11'   # required for get_xid() / video overlay embedding
+
+import time
+import math
+import argparse
+import threading
+from datetime import datetime
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gst', '1.0')
+gi.require_version('GstVideo', '1.0')
+from gi.repository import Gtk, Gst, GstVideo, GLib, Gdk
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
+
+Gst.init(None)
+cflib.crtp.init_drivers()
+
+# ── Config - defaults, overridable from the command line ────────────────────
+DRONE_URI = "udp://10.114.33.101"
+CAM_URL = "http://10.114.33.110:81/stream"  # port 81 = ESP32-CAM MJPEG stream port
+                                              # (port 80 serves the control page only)
+
+# Manual control tuning
+ROLL_PITCH_STEP = 2.0
+MAX_TILT = 15.0
+THRUST_STEP = 2000
+THRUST_MIN = 10000
+THRUST_MAX = 100000
+
+# Safety / robustness tuning
+BATTERY_LOW_V = 3.3               # warn below this (per-cell LiPo sag threshold)
+ARM_CONFIRM_TIMEOUT_S = 3         # Start -> Confirm window before reverting
+VIDEO_WATCHDOG_PERIOD_MS = 2000   # how often to check that frames are flowing
+VIDEO_RECONNECT_MAX_DELAY_S = 8   # backoff cap - retries continue forever
+LOG_DIR = os.path.expanduser("~/litewing_logs")
+
+# ── CSS styling ──────────────────────────────────────────────────────────────
+CSS = b"""
+* { font-family: monospace; }
+window { background-color: #0a0a0a; }
+#title_label { color: #00ff88; font-size: 16px; font-weight: bold; padding: 8px 0px 2px 0px; }
+#section_label { color: #00ff88; font-size: 11px; font-weight: bold; padding: 4px 0px; }
+#status_ok { color: #00ff88; font-size: 11px; font-weight: bold; }
+#status_bad { color: #ff4444; font-size: 11px; font-weight: bold; }
+#status_off { color: #334433; font-size: 11px; }
+#readout { color: #00ff88; font-size: 13px; font-weight: bold; }
+#readout_warn { color: #ff4444; font-size: 13px; font-weight: bold; }
+#video_area { background-color: #050505; }
+#log_view { background-color: #0a0a0a; color: #66cc88; font-family: monospace; font-size: 10px; }
+button { font-family: monospace; }
+#control_panel { background-color: rgba(10, 10, 10, 0.92); border-left: 1px solid #1a3a1a; }
+#menu_toggle { background-color: rgba(10, 10, 10, 0.75); color: #00ff88; border: 1px solid #00aa55;
+               font-size: 16px; font-weight: bold; padding: 6px 12px; }
+#estop_btn { background-color: #3a0808; color: #ff4444; border: 2px solid #cc2222;
+             font-size: 14px; font-weight: bold; padding: 10px 0px; }
+#arm_confirm { background-color: #3a2a08; color: #ffcc00; border: 1px solid #cc9900;
+               font-weight: bold; }
+"""
+
+
+class TiltReferencePainter:
+    """Draws the tilt/bank reference marks (horizon line, pitch ladder,
+    roll-angle ticks, fixed pointer, center chevron) directly onto video
+    frames via GStreamer's cairooverlay element - NOT a GTK widget.
+
+    Runs inside the pipeline on GStreamer's own thread, so the marks are
+    baked into the video pixels before they reach xvimagesink - which is
+    what keeps this compatible with Xv's hardware overlay.
+
+    Color convention:
+      green  = moving references (horizon, ladder, roll arc - move with attitude)
+      yellow = fixed references (top pointer, center chevron - never move)
+    """
+
+    def __init__(self):
+        # Stored as ONE tuple, not two attributes: tuple assignment is a
+        # single atomic reference swap in CPython, so GStreamer's draw
+        # thread can never read a half-updated (new roll, stale pitch) pair.
+        self._attitude = (0.0, 0.0)
+
+    def set_attitude(self, roll_deg, pitch_deg):
+        self._attitude = (roll_deg, pitch_deg)
+
+    def _stroke(self, cr, x1, y1, x2, y2, width=2.0, color=(0.0, 1.0, 0.53)):
+        """Line with a dark outline underneath - visible over any video."""
+        cr.set_source_rgba(0, 0, 0, 0.55)
+        cr.set_line_width(width + 2.5)
+        cr.move_to(x1, y1)
+        cr.line_to(x2, y2)
+        cr.stroke()
+        cr.set_source_rgb(*color)
+        cr.set_line_width(width)
+        cr.move_to(x1, y1)
+        cr.line_to(x2, y2)
+        cr.stroke()
+
+    def _show_outlined_text(self, cr, x, y, text, rotation, font_size):
+        """Outlined text, centered at (x, y), rotated to follow the arc."""
+        cr.save()
+        cr.translate(x, y)
+        cr.rotate(rotation)
+        cr.select_font_face("monospace", 0, 1)
+        cr.set_font_size(font_size)
+        extents = cr.text_extents(text)
+        cr.move_to(-extents.width / 2, extents.height / 2)
+        cr.text_path(text)
+        cr.set_source_rgba(0, 0, 0, 0.75)
+        cr.set_line_width(max(2.5, font_size * 0.3))
+        cr.stroke_preserve()
+        cr.set_source_rgb(0.0, 1.0, 0.53)
+        cr.fill()
+        cr.restore()
+
+    def paint(self, cr, frame_width, frame_height):
+        roll_deg, pitch_deg = self._attitude  # one atomic read per frame
+
+        cx, cy = frame_width / 2, frame_height / 2
+        radius = min(frame_width, frame_height) * 0.16
+        scale = radius / 90.0  # scales every fixed-pixel part together
+
+        cr.save()
+        cr.translate(cx, cy)
+        cr.rotate(-math.radians(roll_deg))
+
+        pixels_per_degree = radius / 45.0
+        # Clamp displayed pitch to the ladder's range (+-60): real telemetry
+        # can exceed it, and past the edge the horizon pins there instead of
+        # drawing meaninglessly off-scale.
+        display_pitch = max(-60.0, min(60.0, pitch_deg))
+        pitch_offset = display_pitch * pixels_per_degree
+
+        # Horizon line + pitch ladder (shift with pitch, rotate with roll)
+        cr.save()
+        cr.translate(0, pitch_offset)
+        big = radius * 1.6
+        self._stroke(cr, -big, 0, big, 0, width=2.0 * scale)
+        for deg in range(-60, 61, 10):
+            if deg == 0:
+                continue
+            y = -deg * pixels_per_degree
+            half = radius * 0.28 if deg % 20 == 0 else radius * 0.16
+            self._stroke(cr, -half, y, half, y, width=1.3 * scale)
+        cr.restore()
+        cr.restore()
+
+        # Roll arc ticks + labels (rotate with roll only, not pitch).
+        # Own larger radius so labels have arc-length between them; capped
+        # against cy so the topmost label never exits the frame.
+        label_reach = 60
+        max_arc_radius = cy - label_reach
+        arc_radius = max(radius * 1.3, min(radius * 2.6, max_arc_radius))
+        cr.save()
+        cr.translate(cx, cy)
+        cr.rotate(-math.radians(roll_deg))
+        for mag in (0, 10, 20, 30, 40):
+            for sign in ((1,) if mag == 0 else (-1, 1)):
+                theta = math.radians(sign * mag)
+                is_labeled = mag % 20 == 0  # label every 20deg, tick every 10deg
+                tick_len = (11 if is_labeled else 6) * scale
+                x1, y1 = arc_radius * math.sin(theta), -arc_radius * math.cos(theta)
+                x2, y2 = (arc_radius + tick_len) * math.sin(theta), -(arc_radius + tick_len) * math.cos(theta)
+                self._stroke(cr, x1, y1, x2, y2, width=1.8 * scale)
+
+                if is_labeled:
+                    label_offset = max(15, 11 * scale)
+                    lx = (arc_radius + tick_len + label_offset) * math.sin(theta)
+                    ly = -(arc_radius + tick_len + label_offset) * math.cos(theta)
+                    label_font_size = max(13, 10 * scale)  # readable floor
+                    label_text = f"-{mag}" if sign < 0 and mag != 0 else str(mag)
+                    self._show_outlined_text(cr, lx, ly, label_text, theta, label_font_size)
+        cr.restore()
+
+        # Fixed pointer (never rotates - always reads current bank).
+        # Yellow = fixed reference.
+        px, py = cx, cy - arc_radius - 4 * scale
+        pw, ph = 6 * scale, 10 * scale
+
+        def _pointer_path(pad):
+            cr.move_to(px - pw - pad, py - ph - pad)
+            cr.line_to(px + pw + pad, py - ph - pad)
+            cr.line_to(px, py + pad)
+            cr.close_path()
+
+        _pointer_path(1.5 * scale)
+        cr.set_source_rgba(0, 0, 0, 0.6)
+        cr.fill()
+        _pointer_path(0)
+        cr.set_source_rgb(1.0, 0.82, 0.05)
+        cr.fill()
+
+        # Fixed center chevron marker (never moves). Yellow = fixed reference.
+        cw = 2.2 * scale
+        chevron_color = (1.0, 0.82, 0.05)
+        self._stroke(cr, cx - 22 * scale, cy + 7 * scale, cx - 4 * scale, cy + 1 * scale, width=cw, color=chevron_color)
+        self._stroke(cr, cx - 4 * scale, cy + 1 * scale, cx, cy + 5 * scale, width=cw, color=chevron_color)
+        self._stroke(cr, cx, cy + 5 * scale, cx + 4 * scale, cy + 1 * scale, width=cw, color=chevron_color)
+        self._stroke(cr, cx + 4 * scale, cy + 1 * scale, cx + 22 * scale, cy + 7 * scale, width=cw, color=chevron_color)
+        cr.set_source_rgba(0, 0, 0, 0.6)
+        cr.arc(cx, cy, 2.5 * scale, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgb(*chevron_color)
+        cr.arc(cx, cy, 1.8 * scale, 0, 2 * math.pi)
+        cr.fill()
+
+
+class DroneVideoApp(Gtk.Window):
+
+    def __init__(self):
+        super().__init__(title="LiteWing Control + Video (GTK, zero-latency)")
+        self.set_default_size(1200, 760)
+
+        # ── Drone/cflib state ─────────────────────────────────────────────
+        self.cf = None
+        self.connected = False
+        self.log_conf = None
+        self.stop_stream_evt = threading.Event()
+        self.armed = False
+        self.setpoint = {"roll": 0.0, "pitch": 0.0, "yaw": 0, "thrust": THRUST_MIN}
+        self.raw_attitude = {"roll": 0.0, "pitch": 0.0}
+        self.calib_offset = {"roll": 0.0, "pitch": 0.0}
+
+        # ── Video/pipeline state ──────────────────────────────────────────
+        self.video_pipeline = None
+        self.video_running = False
+        self.tilt_painter = TiltReferencePainter()
+
+        # ── Video watchdog / reconnect state ─────────────────────────────
+        self._frame_count = 0           # incremented by a pad probe per buffer
+        self._last_frame_count = -1     # what the watchdog saw last check
+        self._reconnect_tries = 0
+        self._watchdog_id = None
+        self._reconnect_timeout_id = None   # pending scheduled reconnect, if any
+        self._video_user_stopped = False    # True = user pressed Stop Camera;
+                                             # suppresses all auto-reconnect
+
+        # ── Two-step arm state ────────────────────────────────────────────
+        self._arm_pending = False
+        self._arm_confirm_timeout_id = None
+
+        # ── Persistent file log ───────────────────────────────────────────
+        self._log_file = None
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            log_path = os.path.join(
+                LOG_DIR, f"flight_{datetime.now():%Y%m%d_%H%M%S}.log")
+            self._log_file = open(log_path, "a", buffering=1)  # line-buffered
+            print(f"[INFO] Logging to {log_path}")
+        except OSError as e:
+            print(f"[WARN] Could not open log file: {e} - continuing without file log")
+
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self._build_ui()
+        self.connect("destroy", self._on_destroy)
+        # Keyboard flight controls (see _on_key_press for bindings)
+        self.connect("key-press-event", self._on_key_press)
+
+    # ======================================================================
+    # UI
+    # ======================================================================
+    def _build_ui(self):
+        overlay = Gtk.Overlay()
+        self.add(overlay)
+
+        # ---------------- Base layer: full-window video ----------------
+        video_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        self.video_status_lbl = Gtk.Label(label=f"CAM: {CAM_URL.split('/')[2]}  //  connecting...")
+        self.video_status_lbl.set_name("status_off")
+        self.video_status_lbl.set_xalign(0)
+        video_box.pack_start(self.video_status_lbl, False, False, 4)
+
+        self.video_area = Gtk.DrawingArea()
+        self.video_area.set_name("video_area")
+        # Connect BEFORE show_all() - show_all() realizes widgets immediately,
+        # firing "realize" right then.
+        self.video_area.connect("realize", self._on_video_area_realize)
+        video_box.pack_start(self.video_area, True, True, 0)
+
+        overlay.add(video_box)
+
+        # ---------------- Overlay: slide-out control panel ----------------
+        self.control_revealer = Gtk.Revealer()
+        self.control_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self.control_revealer.set_transition_duration(200)
+        self.control_revealer.set_halign(Gtk.Align.END)
+        self.control_revealer.set_valign(Gtk.Align.FILL)
+        self.control_revealer.set_reveal_child(False)
+
+        panel_scroll = Gtk.ScrolledWindow()
+        panel_scroll.set_size_request(340, -1)
+        panel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_name("control_panel")
+        left.set_margin_start(10)
+        left.set_margin_end(10)
+        left.set_margin_top(44)
+        left.set_margin_bottom(10)
+
+        title = Gtk.Label(label="◈ LiteWing Drone Control")
+        title.set_name("title_label")
+        left.pack_start(title, False, False, 0)
+
+        self.uri_lbl = Gtk.Label(label=f"Target: {DRONE_URI}")
+        self.uri_lbl.set_xalign(0)
+        left.pack_start(self.uri_lbl, False, False, 0)
+
+        self.status_lbl = Gtk.Label(label="Not connected")
+        self.status_lbl.set_name("status_bad")
+        self.status_lbl.set_xalign(0)
+        left.pack_start(self.status_lbl, False, False, 4)
+
+        # E-STOP: prominent, always available (also bound to spacebar)
+        self.estop_btn = Gtk.Button(label="■ EMERGENCY STOP (Space)")
+        self.estop_btn.set_name("estop_btn")
+        self.estop_btn.connect("clicked", lambda *_: self.do_emergency_stop())
+        left.pack_start(self.estop_btn, False, False, 6)
+
+        self.connect_btn = Gtk.Button(label="Connect")
+        self.connect_btn.connect("clicked", lambda *_: self.do_connect())
+        left.pack_start(self.connect_btn, False, False, 4)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.start_btn = Gtk.Button(label="Start")
+        self.start_btn.set_sensitive(False)
+        self.start_btn.connect("clicked", lambda *_: self.do_start())
+        self.stop_btn = Gtk.Button(label="Stop")
+        self.stop_btn.set_sensitive(False)
+        self.stop_btn.connect("clicked", lambda *_: self.do_stop())
+        btn_row.pack_start(self.start_btn, True, True, 0)
+        btn_row.pack_start(self.stop_btn, True, True, 0)
+        left.pack_start(btn_row, False, False, 6)
+
+        # Camera control - independent of the drone connection
+        self.cam_btn = Gtk.Button(label="Stop Camera")
+        self.cam_btn.connect("clicked", lambda *_: self.toggle_camera())
+        left.pack_start(self.cam_btn, False, False, 4)
+
+        # Telemetry
+        telem_label = Gtk.Label(label="LIVE ATTITUDE")
+        telem_label.set_name("section_label")
+        telem_label.set_xalign(0)
+        left.pack_start(telem_label, False, False, 10)
+
+        self.roll_lbl = Gtk.Label(label="Roll: --")
+        self.roll_lbl.set_name("readout")
+        self.roll_lbl.set_xalign(0)
+        left.pack_start(self.roll_lbl, False, False, 0)
+
+        self.pitch_lbl = Gtk.Label(label="Pitch: --")
+        self.pitch_lbl.set_name("readout")
+        self.pitch_lbl.set_xalign(0)
+        left.pack_start(self.pitch_lbl, False, False, 0)
+
+        self.battery_lbl = Gtk.Label(label="Battery: --")
+        self.battery_lbl.set_name("readout")
+        self.battery_lbl.set_xalign(0)
+        left.pack_start(self.battery_lbl, False, False, 0)
+
+        calib_btn = Gtk.Button(label="Calibrate (zero display)")
+        calib_btn.connect("clicked", lambda *_: self.do_calibrate())
+        left.pack_start(calib_btn, False, False, 4)
+
+        # Manual control
+        manual_label = Gtk.Label(label="MANUAL CONTROL")
+        manual_label.set_name("section_label")
+        manual_label.set_xalign(0)
+        left.pack_start(manual_label, False, False, 10)
+
+        keys_hint = Gtk.Label(label="Keys: arrows=roll/pitch  W/S=thrust  Space=E-STOP")
+        keys_hint.set_name("status_off")
+        keys_hint.set_xalign(0)
+        left.pack_start(keys_hint, False, False, 0)
+
+        self.thrust_lbl = Gtk.Label(label=f"{THRUST_MIN}")
+        self._add_adjust_row(left, "Throttle", self.thrust_lbl,
+                              lambda: self.adjust_thrust(-THRUST_STEP),
+                              lambda: self.adjust_thrust(THRUST_STEP))
+
+        self.pitch_cmd_lbl = Gtk.Label(label="0.0°")
+        self._add_adjust_row(left, "Pitch", self.pitch_cmd_lbl,
+                              lambda: self.adjust_pitch(-ROLL_PITCH_STEP),
+                              lambda: self.adjust_pitch(ROLL_PITCH_STEP))
+
+        self.roll_cmd_lbl = Gtk.Label(label="0.0°")
+        self._add_adjust_row(left, "Roll", self.roll_cmd_lbl,
+                              lambda: self.adjust_roll(-ROLL_PITCH_STEP),
+                              lambda: self.adjust_roll(ROLL_PITCH_STEP))
+
+        center_btn = Gtk.Button(label="Center (level)")
+        center_btn.connect("clicked", lambda *_: self.center_attitude())
+        left.pack_start(center_btn, False, False, 4)
+
+        # Log
+        log_label = Gtk.Label(label="LOG")
+        log_label.set_name("section_label")
+        log_label.set_xalign(0)
+        left.pack_start(log_label, False, False, 10)
+
+        self.log_view = Gtk.TextView()
+        self.log_view.set_name("log_view")
+        self.log_view.set_editable(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.log_view.set_size_request(-1, 160)
+        left.pack_start(self.log_view, False, False, 4)
+
+        panel_scroll.add(left)
+        self.control_revealer.add(panel_scroll)
+        overlay.add_overlay(self.control_revealer)
+
+        # ---------------- Overlay: toggle button (added LAST = topmost) ----
+        self.menu_toggle_btn = Gtk.Button(label="☰")
+        self.menu_toggle_btn.set_name("menu_toggle")
+        self.menu_toggle_btn.set_halign(Gtk.Align.END)
+        self.menu_toggle_btn.set_valign(Gtk.Align.START)
+        self.menu_toggle_btn.set_margin_end(8)
+        self.menu_toggle_btn.set_margin_top(8)
+        self.menu_toggle_btn.connect("clicked", lambda *_: self._toggle_control_panel())
+        overlay.add_overlay(self.menu_toggle_btn)
+
+        self.show_all()
+        self.control_revealer.set_reveal_child(False)
+
+    def _toggle_control_panel(self):
+        showing = self.control_revealer.get_reveal_child()
+        self.control_revealer.set_reveal_child(not showing)
+
+    def _add_adjust_row(self, parent, label_text, value_label, on_minus, on_plus):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl = Gtk.Label(label=f"{label_text}:")
+        lbl.set_xalign(0)
+        lbl.set_size_request(70, -1)
+        minus_btn = Gtk.Button(label="-")
+        minus_btn.connect("clicked", lambda *_: on_minus())
+        plus_btn = Gtk.Button(label="+")
+        plus_btn.connect("clicked", lambda *_: on_plus())
+        value_label.set_name("readout")
+        row.pack_start(lbl, False, False, 0)
+        row.pack_start(minus_btn, False, False, 0)
+        row.pack_start(value_label, True, True, 0)
+        row.pack_start(plus_btn, False, False, 0)
+        parent.pack_start(row, False, False, 2)
+
+    # ======================================================================
+    # Keyboard flight controls
+    # ======================================================================
+    def _on_key_press(self, widget, event):
+        key = event.keyval
+        if key == Gdk.KEY_space:
+            self.do_emergency_stop()
+            return True
+        if key == Gdk.KEY_Left:
+            self.adjust_roll(-ROLL_PITCH_STEP)
+            return True
+        if key == Gdk.KEY_Right:
+            self.adjust_roll(ROLL_PITCH_STEP)
+            return True
+        if key == Gdk.KEY_Up:
+            self.adjust_pitch(ROLL_PITCH_STEP)
+            return True
+        if key == Gdk.KEY_Down:
+            self.adjust_pitch(-ROLL_PITCH_STEP)
+            return True
+        if key in (Gdk.KEY_w, Gdk.KEY_W):
+            self.adjust_thrust(THRUST_STEP)
+            return True
+        if key in (Gdk.KEY_s, Gdk.KEY_S):
+            self.adjust_thrust(-THRUST_STEP)
+            return True
+        if key in (Gdk.KEY_c, Gdk.KEY_C):
+            self.center_attitude()
+            return True
+        return False  # let other keys through (e.g. panel interaction)
+
+    # ======================================================================
+    # Thread-safe GUI helpers
+    # ======================================================================
+    def gui_log(self, msg):
+        stamped = f"{datetime.now():%H:%M:%S}  {msg}"
+        # Mirror to the persistent file log (thread-safe enough for a
+        # line-buffered append-only text file)
+        if self._log_file is not None:
+            try:
+                self._log_file.write(stamped + "\n")
+            except OSError:
+                pass
+
+        def _append():
+            buf = self.log_view.get_buffer()
+            buf.insert(buf.get_end_iter(), stamped + "\n")
+            self.log_view.scroll_to_iter(buf.get_end_iter(), 0, False, 0, 0)
+            return False
+        GLib.idle_add(_append)
+
+    def _set_attitude_display(self, roll, pitch):
+        def _apply():
+            self.roll_lbl.set_text(f"Roll: {roll:.2f}°")
+            self.pitch_lbl.set_text(f"Pitch: {pitch:.2f}°")
+            self.tilt_painter.set_attitude(roll, pitch)
+            return False
+        GLib.idle_add(_apply)
+
+    def _set_battery_display(self, vbat):
+        def _apply():
+            self.battery_lbl.set_text(f"Battery: {vbat:.2f} V")
+            self.battery_lbl.set_name(
+                "readout_warn" if vbat < BATTERY_LOW_V else "readout")
+            return False
+        GLib.idle_add(_apply)
+
+    def _update_cmd_display(self):
+        self.thrust_lbl.set_text(f"{self.setpoint['thrust']}")
+        self.pitch_cmd_lbl.set_text(f"{self.setpoint['pitch']:.1f}°")
+        self.roll_cmd_lbl.set_text(f"{self.setpoint['roll']:.1f}°")
+
+    # ======================================================================
+    # cflib / drone logic
+    # ======================================================================
+    def make_crazyflie(self):
+        new_cf = Crazyflie()
+        new_cf.connected.add_callback(self._on_connected)
+        new_cf.connection_failed.add_callback(self._on_connection_failed)
+        new_cf.disconnected.add_callback(self._on_disconnected)
+        return new_cf
+
+    def do_connect(self):
+        if self.connected:
+            self.gui_log("Already connected.")
+            return
+        self.cf = self.make_crazyflie()
+        self.gui_log("Connecting to drone...")
+        self.connect_btn.set_sensitive(False)
+        self.connect_btn.set_label("Connecting...")
+        self.cf.open_link(DRONE_URI)
+
+    # ── Two-step arm: Start -> "CONFIRM ARM?" (3s window) -> armed ───────
+    def do_start(self):
+        if not self.connected:
+            self.gui_log("Not connected yet - click Connect first.")
+            return
+
+        if not self._arm_pending:
+            self._arm_pending = True
+            self.start_btn.set_label("CONFIRM ARM?")
+            self.start_btn.set_name("arm_confirm")
+            self._arm_confirm_timeout_id = GLib.timeout_add_seconds(
+                ARM_CONFIRM_TIMEOUT_S, self._arm_confirm_expired)
+            self.gui_log(f"Arm requested - click again within "
+                         f"{ARM_CONFIRM_TIMEOUT_S}s to confirm.")
+            return
+
+        # Second click within the window: actually arm
+        self._cancel_arm_confirm()
+        self.gui_log("Motors ARMED - streaming real setpoint.")
+        self.armed = True
+        self.start_btn.set_sensitive(False)
+        self.stop_btn.set_sensitive(True)
+
+    def _arm_confirm_expired(self):
+        if self._arm_pending:
+            self.gui_log("Arm request timed out - not armed.")
+            # This source auto-removes when we return False - clear the id
+            # first so _cancel_arm_confirm doesn't source_remove it again
+            # (which would emit a 'Source ID not found' warning).
+            self._arm_confirm_timeout_id = None
+            self._cancel_arm_confirm()
+        return False  # one-shot
+
+    def _cancel_arm_confirm(self):
+        self._arm_pending = False
+        if self._arm_confirm_timeout_id is not None:
+            GLib.source_remove(self._arm_confirm_timeout_id)
+            self._arm_confirm_timeout_id = None
+        self.start_btn.set_label("Start")
+        self.start_btn.set_name("")
+
+    def do_stop(self):
+        self.gui_log("Motors STOPPED - streaming zero setpoint (still connected).")
+        self.armed = False
+        self.start_btn.set_sensitive(True)
+        self.stop_btn.set_sensitive(False)
+
+    def do_emergency_stop(self):
+        """Immediate motor cut - stronger than Stop. Sends the firmware's
+        stop-setpoint (motors off now), disarms, cancels any pending arm.
+        Safe to press at any time, connected or not."""
+        self.armed = False
+        self._cancel_arm_confirm()
+        self.start_btn.set_sensitive(self.connected)
+        self.stop_btn.set_sensitive(False)
+        # Reset commanded values so a re-arm doesn't jump straight back
+        self.setpoint["roll"] = 0.0
+        self.setpoint["pitch"] = 0.0
+        self.setpoint["thrust"] = THRUST_MIN
+        self._update_cmd_display()
+
+        if self.connected and self.cf is not None:
+            try:
+                for _ in range(3):  # a few sends in case one is dropped
+                    self.cf.commander.send_stop_setpoint()
+                    time.sleep(0.01)
+                self.gui_log("*** EMERGENCY STOP - stop-setpoint sent, motors cut. ***")
+            except Exception as e:
+                self.gui_log(f"*** EMERGENCY STOP - send failed ({e}) - "
+                             f"link may be down; firmware failsafe should cut motors. ***")
+        else:
+            self.gui_log("*** EMERGENCY STOP pressed (not connected - nothing to send). ***")
+
+    def adjust_roll(self, delta):
+        self.setpoint["roll"] = max(-MAX_TILT, min(MAX_TILT, self.setpoint["roll"] + delta))
+        self._update_cmd_display()
+
+    def adjust_pitch(self, delta):
+        self.setpoint["pitch"] = max(-MAX_TILT, min(MAX_TILT, self.setpoint["pitch"] + delta))
+        self._update_cmd_display()
+
+    def adjust_thrust(self, delta):
+        self.setpoint["thrust"] = max(THRUST_MIN, min(THRUST_MAX, self.setpoint["thrust"] + delta))
+        self._update_cmd_display()
+
+    def center_attitude(self):
+        self.setpoint["roll"] = 0.0
+        self.setpoint["pitch"] = 0.0
+        self.gui_log("Roll/pitch centered to level.")
+        self._update_cmd_display()
+
+    def do_calibrate(self):
+        self.calib_offset["roll"] = self.raw_attitude["roll"]
+        self.calib_offset["pitch"] = self.raw_attitude["pitch"]
+        self.gui_log(
+            f"Display calibrated - offset stored (raw roll={self.raw_attitude['roll']:.2f}, "
+            f"raw pitch={self.raw_attitude['pitch']:.2f}). Display-only."
+        )
+
+    def start_telemetry(self):
+        log_conf = LogConfig(name='AttitudeLog', period_in_ms=100)
+        try:
+            log_conf.add_variable('stabilizer.roll', 'float')
+            log_conf.add_variable('stabilizer.pitch', 'float')
+            log_conf.add_variable('pm.vbat', 'float')   # battery voltage
+        except (KeyError, AttributeError) as e:
+            self.gui_log(f"[LOG ERROR] Couldn't find expected variables: {e}")
+            return
+
+        def log_data_cb(timestamp, data, logconf):
+            roll = data.get('stabilizer.roll', 0.0)
+            pitch = data.get('stabilizer.pitch', 0.0)
+            vbat = data.get('pm.vbat', 0.0)
+            self.raw_attitude["roll"] = roll
+            self.raw_attitude["pitch"] = pitch
+            self._set_attitude_display(roll - self.calib_offset["roll"],
+                                        pitch - self.calib_offset["pitch"])
+            self._set_battery_display(vbat)
+
+        def log_error_cb(logconf, msg):
+            self.gui_log(f"[LOG ERROR] {msg}")
+
+        log_conf.data_received_cb.add_callback(log_data_cb)
+        log_conf.error_cb.add_callback(log_error_cb)
+        try:
+            self.cf.log.add_config(log_conf)
+            log_conf.start()
+        except (KeyError, AttributeError) as e:
+            # pm.vbat missing from this firmware's TOC - fall back without it
+            self.gui_log(f"[WARN] Battery variable unavailable ({e}) - "
+                         f"retrying telemetry without it.")
+            self._start_telemetry_no_battery()
+            return
+        self.log_conf = log_conf
+        self.gui_log("Telemetry started - roll/pitch/battery streaming.")
+
+    def _start_telemetry_no_battery(self):
+        log_conf = LogConfig(name='AttitudeLogNB', period_in_ms=100)
+        log_conf.add_variable('stabilizer.roll', 'float')
+        log_conf.add_variable('stabilizer.pitch', 'float')
+
+        def log_data_cb(timestamp, data, logconf):
+            roll = data.get('stabilizer.roll', 0.0)
+            pitch = data.get('stabilizer.pitch', 0.0)
+            self.raw_attitude["roll"] = roll
+            self.raw_attitude["pitch"] = pitch
+            self._set_attitude_display(roll - self.calib_offset["roll"],
+                                        pitch - self.calib_offset["pitch"])
+
+        log_conf.data_received_cb.add_callback(log_data_cb)
+        log_conf.error_cb.add_callback(lambda lc, m: self.gui_log(f"[LOG ERROR] {m}"))
+        self.cf.log.add_config(log_conf)
+        log_conf.start()
+        self.log_conf = log_conf
+        self.gui_log("Telemetry started - roll/pitch streaming (no battery var).")
+
+    def stop_telemetry(self):
+        if self.log_conf is not None:
+            try:
+                self.log_conf.stop()
+            except Exception:
+                pass
+            self.log_conf = None
+
+        def _clear():
+            self.roll_lbl.set_text("Roll: --")
+            self.pitch_lbl.set_text("Pitch: --")
+            self.battery_lbl.set_text("Battery: --")
+            self.battery_lbl.set_name("readout")
+            self.tilt_painter.set_attitude(0.0, 0.0)
+            return False
+        GLib.idle_add(_clear)
+
+    def persistent_stream(self):
+        """Setpoint keepalive - runs on its own thread, hardened so a link
+        error can never make it die silently: failures surface in the log
+        and the loop keeps trying while connected (the firmware's own
+        no-setpoint failsafe is the backstop if the link is truly gone)."""
+        consecutive_errors = 0
+        while self.connected and not self.stop_stream_evt.is_set():
+            try:
+                if self.armed:
+                    self.cf.commander.send_setpoint(
+                        self.setpoint["roll"], self.setpoint["pitch"],
+                        self.setpoint["yaw"], self.setpoint["thrust"]
+                    )
+                else:
+                    self.cf.commander.send_setpoint(0, 0, 0, 0)
+                if consecutive_errors:
+                    self.gui_log("[STREAM] Link recovered - setpoints flowing again.")
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors == 1:  # log the first, not a flood
+                    self.gui_log(f"[STREAM ERROR] send_setpoint failed: {e} - retrying...")
+                elif consecutive_errors == 10:
+                    self.gui_log("[STREAM ERROR] 10 consecutive send failures - "
+                                 "link likely down; firmware failsafe should cut motors.")
+            time.sleep(0.1)
+        self.gui_log("[STREAM] Setpoint stream stopped.")
+
+    # ── cflib callbacks (fire on cflib's own background thread) ──────────
+    def _on_connected(self, link_uri):
+        def _apply():
+            self.connected = True
+            self.gui_log(f"[OK] Connected: {link_uri}")
+            self.status_lbl.set_text("Connected")
+            self.status_lbl.set_name("status_ok")
+            self.connect_btn.set_sensitive(False)
+            self.connect_btn.set_label("Connected")
+            self.start_btn.set_sensitive(True)
+            self.start_telemetry()
+            self.stop_stream_evt.clear()
+            threading.Thread(target=self.persistent_stream, daemon=True).start()
+            return False
+        GLib.idle_add(_apply)
+
+    def _on_connection_failed(self, link_uri, msg):
+        def _apply():
+            self.connected = False
+            self.gui_log(f"[FAIL] {msg}")
+            self.status_lbl.set_text("Connection failed")
+            self.status_lbl.set_name("status_bad")
+            self.connect_btn.set_sensitive(True)
+            self.connect_btn.set_label("Connect")
+            self.start_btn.set_sensitive(False)
+            return False
+        GLib.idle_add(_apply)
+
+    def _on_disconnected(self, link_uri):
+        def _apply():
+            self.connected = False
+            self.armed = False
+            self._cancel_arm_confirm()
+            self.stop_stream_evt.set()
+            self.gui_log(f"[INFO] Disconnected: {link_uri}")
+            self.status_lbl.set_text("Disconnected")
+            self.status_lbl.set_name("status_bad")
+            self.connect_btn.set_sensitive(True)
+            self.connect_btn.set_label("Connect")
+            self.start_btn.set_sensitive(False)
+            self.stop_btn.set_sensitive(False)
+            self.stop_telemetry()
+            return False
+        GLib.idle_add(_apply)
+
+    # ======================================================================
+    # Video (GStreamer, xvimagesink + cairooverlay)
+    # ======================================================================
+    def _build_video_pipeline(self):
+        pipe_str = (
+            f'souphttpsrc location="{CAM_URL}" is-live=true do-timestamp=true '
+            f'! multipartdemux '
+            f'! image/jpeg '
+            f'! jpegdec '
+            f'! videoconvert '
+            f'! video/x-raw,format=BGRx '
+            f'! cairooverlay name=tiltoverlay '
+            f'! videoconvert '
+            f'! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 '
+            f'! xvimagesink name=sink sync=false'
+        )
+        print(f"[INFO] Video pipeline:\n{pipe_str}\n")
+
+        pipeline = Gst.parse_launch(pipe_str)
+
+        self._overlay_frame_size = (640, 480)  # fallback until caps-changed fires
+        tiltoverlay = pipeline.get_by_name('tiltoverlay')
+        tiltoverlay.connect('caps-changed', self._on_overlay_caps_changed)
+        tiltoverlay.connect('draw', self._on_overlay_draw)
+
+        sink = pipeline.get_by_name('sink')
+        gdk_window = self.video_area.get_window()
+        if gdk_window is None:
+            raise RuntimeError("video_area not realized yet - no X window to embed into")
+        xid = gdk_window.get_xid()
+        sink.set_window_handle(xid)
+
+        # Watchdog frame counter: a pad probe on the sink's input pad
+        # increments _frame_count for every buffer that actually arrives -
+        # the watchdog timer then knows whether frames are really flowing.
+        sink_pad = sink.get_static_pad('sink')
+        sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
+
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_video_bus_message)
+
+        return pipeline
+
+    def _on_frame_probe(self, pad, info):
+        self._frame_count += 1
+        return Gst.PadProbeReturn.OK
+
+    def _on_overlay_caps_changed(self, overlay, caps):
+        struct = caps.get_structure(0)
+        width = struct.get_value('width')
+        height = struct.get_value('height')
+        if width and height:
+            self._overlay_frame_size = (width, height)
+
+    def _on_overlay_draw(self, overlay, cr, timestamp, duration):
+        # GStreamer's thread, once per frame. No GTK calls here.
+        width, height = self._overlay_frame_size
+        self.tilt_painter.paint(cr, width, height)
+
+    def _on_video_area_realize(self, widget):
+        GLib.idle_add(self._start_video_delayed)
+
+    def _start_video_delayed(self):
+        if self._video_user_stopped:
+            return False  # user stopped the camera while this was queued
+        try:
+            self.video_pipeline = self._build_video_pipeline()
+            self.video_pipeline.set_state(Gst.State.PLAYING)
+            self.video_running = True
+            self.video_status_lbl.set_text(f"CAM: {CAM_URL.split('/')[2]}  //  LIVE")
+            self.video_status_lbl.set_name("status_ok")
+            self._start_watchdog()
+        except Exception as e:
+            self.video_status_lbl.set_text(f"Video failed: {e}")
+            self.video_status_lbl.set_name("status_bad")
+        return False  # one-shot idle callback
+
+    # ── Video watchdog: stall detection + auto-reconnect with backoff ────
+    def _start_watchdog(self):
+        if self._watchdog_id is None:
+            self._last_frame_count = -1
+            self._watchdog_id = GLib.timeout_add(
+                VIDEO_WATCHDOG_PERIOD_MS, self._video_watchdog_tick)
+
+    def _stop_watchdog(self):
+        if self._watchdog_id is not None:
+            GLib.source_remove(self._watchdog_id)
+            self._watchdog_id = None
+
+    def _video_watchdog_tick(self):
+        if self._video_user_stopped:
+            return True  # user stopped the camera - watch but do nothing
+        if not self.video_running:
+            return True  # reconnect logic handles restarting
+
+        if self._frame_count == self._last_frame_count:
+            # No new frames since last check -> stalled
+            self.gui_log("[VIDEO] Feed stalled - no frames in "
+                         f"{VIDEO_WATCHDOG_PERIOD_MS} ms. Reconnecting...")
+            self._attempt_video_reconnect()
+        else:
+            if self._reconnect_tries:
+                self.gui_log("[VIDEO] Feed recovered.")
+            self._reconnect_tries = 0  # progress resets the backoff
+        self._last_frame_count = self._frame_count
+        return True  # keep the timer running
+
+    def _attempt_video_reconnect(self):
+        if self._video_user_stopped:
+            return  # user explicitly stopped the camera - don't fight them
+        if self._reconnect_timeout_id is not None:
+            return  # a reconnect is already scheduled
+        self._stop_video()
+        self._reconnect_tries += 1
+        # Never give up - just cap the backoff so retries settle at a
+        # steady interval instead of stretching forever.
+        delay_s = min(2 ** (self._reconnect_tries - 1), VIDEO_RECONNECT_MAX_DELAY_S)
+        self.video_status_lbl.set_text(
+            f"Video: reconnecting (attempt {self._reconnect_tries}) in {delay_s}s... "
+            f"(or press Stop Camera)")
+        self.video_status_lbl.set_name("status_bad")
+        self._reconnect_timeout_id = GLib.timeout_add_seconds(
+            delay_s, self._reconnect_fire)
+
+    def _reconnect_fire(self):
+        # The scheduled reconnect timer fired - clear its id (it auto-
+        # removes by returning False) and start the pipeline unless the
+        # user stopped the camera while we were waiting.
+        self._reconnect_timeout_id = None
+        if not self._video_user_stopped:
+            self._start_video_delayed()
+        return False  # one-shot
+
+    def toggle_camera(self):
+        """Manual camera control - fully independent of the drone link.
+        Stop cancels any in-flight auto-reconnect; Start resets the retry
+        counter and brings the feed back up."""
+        if self._video_user_stopped:
+            # -> START
+            self._video_user_stopped = False
+            self._reconnect_tries = 0
+            self.cam_btn.set_label("Stop Camera")
+            self.gui_log("[VIDEO] Camera started by user.")
+            self.video_status_lbl.set_text(
+                f"CAM: {CAM_URL.split('/')[2]}  //  connecting...")
+            self.video_status_lbl.set_name("status_off")
+            self._start_video_delayed()
+        else:
+            # -> STOP
+            self._video_user_stopped = True
+            if self._reconnect_timeout_id is not None:
+                GLib.source_remove(self._reconnect_timeout_id)
+                self._reconnect_timeout_id = None
+            self._stop_video()
+            self.cam_btn.set_label("Start Camera")
+            self.gui_log("[VIDEO] Camera stopped by user.")
+            self.video_status_lbl.set_text("Video: stopped by user")
+            self.video_status_lbl.set_name("status_off")
+
+    def _stop_video(self):
+        if self.video_pipeline:
+            self.video_pipeline.set_state(Gst.State.NULL)
+            self.video_pipeline = None
+        self.video_running = False
+
+    def _on_video_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"[VIDEO ERROR] {err.message}\n[DEBUG] {debug}")
+            self.gui_log(f"[VIDEO ERROR] {err.message}")
+            self._stop_video()
+            self.video_status_lbl.set_text(f"Video error: {err.message}")
+            self.video_status_lbl.set_name("status_bad")
+            self._attempt_video_reconnect()
+        elif t == Gst.MessageType.EOS:
+            self.gui_log("[VIDEO] Stream ended.")
+            self._stop_video()
+            self.video_status_lbl.set_text("Video stream ended - reconnecting...")
+            self.video_status_lbl.set_name("status_bad")
+            self._attempt_video_reconnect()
+
+    # ======================================================================
+    # Shutdown
+    # ======================================================================
+    def _on_destroy(self, *args):
+        self.armed = False
+        self.stop_stream_evt.set()
+        time.sleep(0.2)
+        self._stop_watchdog()
+        if self._reconnect_timeout_id is not None:
+            GLib.source_remove(self._reconnect_timeout_id)
+            self._reconnect_timeout_id = None
+        self.stop_telemetry()
+        if self.cf is not None:
+            try:
+                self.cf.close_link()
+            except Exception:
+                pass
+        self._stop_video()
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+        Gtk.main_quit()
+
+
+def main():
+    global DRONE_URI, CAM_URL
+    parser = argparse.ArgumentParser(description="LiteWing drone control + ESP32-CAM video GUI")
+    parser.add_argument("--drone", default=DRONE_URI,
+                        help=f"Drone link URI (default: {DRONE_URI})")
+    parser.add_argument("--cam", default=CAM_URL,
+                        help=f"ESP32-CAM stream URL (default: {CAM_URL})")
+    args = parser.parse_args()
+    DRONE_URI = args.drone
+    CAM_URL = args.cam
+
+    app = DroneVideoApp()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

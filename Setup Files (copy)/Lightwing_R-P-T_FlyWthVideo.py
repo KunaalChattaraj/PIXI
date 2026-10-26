@@ -1,0 +1,465 @@
+import time
+import threading
+import tkinter as tk
+from tkinter import scrolledtext
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
+
+from PIL import Image, ImageTk
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst, GLib
+
+# Update this to match your drone's current IP
+DRONE_URI = "udp://10.114.33.101"
+
+# ESP32-CAM video feed - MJPEG over HTTP, same pipeline you validated with
+# gst-launch, just swapped autovideosink for appsink so we can pull frames
+# into the Tkinter GUI instead of opening a separate window.
+ESP32_CAM_IP = "10.114.33.110"   # <-- set to your ESP32-CAM's actual IP
+VIDEO_PIPELINE = (
+    f'souphttpsrc location="http://{ESP32_CAM_IP}:81/stream" '
+    "! multipartdemux "
+    "! image/jpeg "
+    "! jpegdec "
+    "! videoconvert "
+    "! video/x-raw,format=RGB "
+    "! appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
+)
+VIDEO_DISPLAY_WIDTH = 480   # resize incoming frames to fit the panel
+
+cflib.crtp.init_drivers()
+Gst.init(None)
+
+state = {
+    "cf": None,
+    "connected": False,
+    "log_conf": None,
+}
+stop_stream = threading.Event()
+armed = {"value": False}
+setpoint = {"roll": 0.0, "pitch": 0.0, "yaw": 0, "thrust": 10000}
+raw_attitude = {"roll": 0.0, "pitch": 0.0}
+calib_offset = {"roll": 0.0, "pitch": 0.0}
+
+# Manual control tuning - conservative defaults, raise later once trusted
+ROLL_PITCH_STEP = 2.0   # degrees per button press
+MAX_TILT = 15.0         # degrees, clamp in both directions
+THRUST_STEP = 2000
+THRUST_MIN = 10000
+THRUST_MAX = 100000      # deliberately below the firmware's 60000 ceiling for now
+
+
+class VideoStream:
+    """Runs a GStreamer pipeline on a background thread and pushes decoded
+    frames into a Tkinter label. Completely independent of the drone
+    connection - starts/stops on its own, same as your log() pattern,
+    frames are marshalled onto the GUI thread via .after(0, ...)."""
+
+    def __init__(self, pipeline_str, display_widget, status_setter):
+        self.pipeline_str = pipeline_str
+        self.display_widget = display_widget
+        self.status_setter = status_setter
+        self.pipeline = None
+        self.loop = None
+        self._thread = None
+        self._photo_ref = None  # keep a reference alive, Tk drops GC'd images
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self.pipeline = Gst.parse_launch(self.pipeline_str)
+        except GLib.Error as e:
+            self._set_status(f"Pipeline error: {e}")
+            return
+
+        appsink = self.pipeline.get_by_name("sink")
+        appsink.connect("new-sample", self._on_new_sample)
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self._set_status("Video: playing")
+
+        self.loop = GLib.MainLoop()
+        try:
+            self.loop.run()
+        finally:
+            self.pipeline.set_state(Gst.State.NULL)
+
+    def _on_new_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        width = caps.get_structure(0).get_value("width")
+        height = caps.get_structure(0).get_value("height")
+
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.ERROR
+
+        try:
+            img = Image.frombytes("RGB", (width, height), bytes(mapinfo.data))
+            if VIDEO_DISPLAY_WIDTH and width != VIDEO_DISPLAY_WIDTH:
+                ratio = VIDEO_DISPLAY_WIDTH / width
+                img = img.resize((VIDEO_DISPLAY_WIDTH, int(height * ratio)))
+            self._update_frame(img)
+        finally:
+            buf.unmap(mapinfo)
+
+        return Gst.FlowReturn.OK
+
+    def _update_frame(self, pil_img):
+        def apply():
+            photo = ImageTk.PhotoImage(pil_img)
+            self._photo_ref = photo  # prevent garbage collection
+            self.display_widget.config(image=photo)
+        self.display_widget.after(0, apply)
+
+    def _on_bus_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            self._set_status(f"Video error: {err}")
+            self.stop()
+        elif t == Gst.MessageType.EOS:
+            self._set_status("Video: stream ended")
+            self.stop()
+
+    def _set_status(self, text):
+        self.status_setter(text)
+
+    def stop(self):
+        if self.loop and self.loop.is_running():
+            self.loop.quit()
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+
+
+def log(msg):
+    """Thread-safe way to write into the GUI log box from a background thread."""
+    log_box.after(0, lambda: (log_box.insert(tk.END, msg + "\n"), log_box.see(tk.END)))
+
+
+def set_attitude_display(roll, pitch):
+    """Thread-safe update of the roll/pitch readout - log data arrives on
+    a background thread, so GUI updates must be scheduled via .after()."""
+    log_box.after(0, lambda: (roll_var.set(f"{roll:.2f}°"), pitch_var.set(f"{pitch:.2f}°")))
+
+
+def make_crazyflie():
+    """A fresh Crazyflie() must be created for every connection attempt -
+    cflib starts an internal background thread on open_link(), and a
+    Python thread object can only ever be started once, even after it
+    finishes. Reusing one instance across multiple Connect clicks causes
+    'threads can only be started once'."""
+    new_cf = Crazyflie()
+    new_cf.connected.add_callback(on_connected)
+    new_cf.connection_failed.add_callback(on_connection_failed)
+    new_cf.disconnected.add_callback(on_disconnected)
+    return new_cf
+
+
+def start_telemetry():
+    """Subscribes to the drone's internal roll/pitch estimate and streams
+    it back to the PC at 10Hz."""
+    log_conf = LogConfig(name='AttitudeLog', period_in_ms=100)
+    try:
+        log_conf.add_variable('stabilizer.roll', 'float')
+        log_conf.add_variable('stabilizer.pitch', 'float')
+    except (KeyError, AttributeError) as e:
+        log(f"[LOG ERROR] Couldn't find expected variables: {e}")
+        log("Available log groups reported by this firmware's TOC:")
+        try:
+            groups = sorted(set(state["cf"].log.toc.toc.keys()))
+            for g in groups[:25]:
+                log(f"  - {g}")
+        except Exception:
+            pass
+        return
+
+    def log_data_cb(timestamp, data, logconf):
+        roll = data.get('stabilizer.roll', 0.0)
+        pitch = data.get('stabilizer.pitch', 0.0)
+        raw_attitude["roll"] = roll
+        raw_attitude["pitch"] = pitch
+        set_attitude_display(roll - calib_offset["roll"], pitch - calib_offset["pitch"])
+
+    def log_error_cb(logconf, msg):
+        log(f"[LOG ERROR] {msg}")
+
+    log_conf.data_received_cb.add_callback(log_data_cb)
+    log_conf.error_cb.add_callback(log_error_cb)
+    state["cf"].log.add_config(log_conf)
+    log_conf.start()
+    state["log_conf"] = log_conf
+    log("Telemetry started - live roll/pitch now streaming.")
+
+
+def stop_telemetry():
+    if state["log_conf"] is not None:
+        try:
+            state["log_conf"].stop()
+        except Exception:
+            pass
+        state["log_conf"] = None
+    roll_var.set("--")
+    pitch_var.set("--")
+
+
+def persistent_stream():
+    """Runs for the ENTIRE connected session, not just while 'Started'.
+    Continuously sends a setpoint every 100ms - zero when idle, the real
+    values when armed. Sending continuously (even zeros) keeps the
+    outbound UDP path alive through the hotspot/router's NAT translation,
+    so return traffic like telemetry keeps flowing, and it keeps the
+    firmware's safety watchdog satisfied at all times rather than only
+    while motors are actively spinning."""
+    cf = state["cf"]
+    while state["connected"] and not stop_stream.is_set():
+        if armed["value"]:
+            cf.commander.send_setpoint(setpoint["roll"], setpoint["pitch"], setpoint["yaw"], setpoint["thrust"])
+        else:
+            cf.commander.send_setpoint(0, 0, 0, 0)
+        time.sleep(0.1)
+
+
+def on_connected(link_uri):
+    state["connected"] = True
+    log(f"[OK] Connected: {link_uri}")
+    status_var.set("Connected")
+    status_label.config(fg="#2e7d32")
+    connect_btn.config(state=tk.DISABLED, text="Connected")
+    start_btn.config(state=tk.NORMAL)
+    start_telemetry()
+    stop_stream.clear()
+    threading.Thread(target=persistent_stream, daemon=True).start()
+
+
+def on_connection_failed(link_uri, msg):
+    state["connected"] = False
+    log(f"[FAIL] {msg}")
+    status_var.set("Connection failed")
+    status_label.config(fg="#c62828")
+    connect_btn.config(state=tk.NORMAL, text="Connect")
+    start_btn.config(state=tk.DISABLED)
+
+
+def on_disconnected(link_uri):
+    state["connected"] = False
+    armed["value"] = False
+    stop_stream.set()
+    log(f"[INFO] Disconnected: {link_uri}")
+    status_var.set("Disconnected")
+    status_label.config(fg="#c62828")
+    connect_btn.config(state=tk.NORMAL, text="Connect")
+    start_btn.config(state=tk.DISABLED)
+    stop_btn.config(state=tk.DISABLED)
+    stop_telemetry()
+
+
+def do_connect():
+    if state["connected"]:
+        log("Already connected.")
+        return
+    state["cf"] = make_crazyflie()
+    log("Connecting to drone...")
+    connect_btn.config(state=tk.DISABLED, text="Connecting...")
+    state["cf"].open_link(DRONE_URI)
+
+
+def do_start():
+    if not state["connected"]:
+        log("Not connected yet - click Connect first.")
+        return
+    log("Motors ARMED - streaming real setpoint.")
+    armed["value"] = True
+    start_btn.config(state=tk.DISABLED)
+    stop_btn.config(state=tk.NORMAL)
+
+
+def do_stop():
+    log("Motors STOPPED - streaming zero setpoint (still connected).")
+    armed["value"] = False
+    start_btn.config(state=tk.NORMAL)
+    stop_btn.config(state=tk.DISABLED)
+
+
+def update_cmd_display():
+    cmd_roll_var.set(f"{setpoint['roll']:.1f}°")
+    cmd_pitch_var.set(f"{setpoint['pitch']:.1f}°")
+    cmd_thrust_var.set(f"{setpoint['thrust']}")
+
+
+def adjust_roll(delta):
+    setpoint["roll"] = max(-MAX_TILT, min(MAX_TILT, setpoint["roll"] + delta))
+    update_cmd_display()
+
+
+def adjust_pitch(delta):
+    setpoint["pitch"] = max(-MAX_TILT, min(MAX_TILT, setpoint["pitch"] + delta))
+    update_cmd_display()
+
+
+def adjust_thrust(delta):
+    setpoint["thrust"] = max(THRUST_MIN, min(THRUST_MAX, setpoint["thrust"] + delta))
+    update_cmd_display()
+
+
+def center_attitude():
+    setpoint["roll"] = 0.0
+    setpoint["pitch"] = 0.0
+    log("Roll/pitch centered to level.")
+    update_cmd_display()
+
+
+def do_calibrate():
+    """Zeroes the DISPLAY only - captures the current raw reading as the
+    new baseline. This does NOT change how the drone actually flies,
+    since the flight controller still uses the raw sensor value
+    internally. For a fix that affects real flight behavior, the
+    firmware's own calibration angle (menuconfig) needs to be set."""
+    calib_offset["roll"] = raw_attitude["roll"]
+    calib_offset["pitch"] = raw_attitude["pitch"]
+    log(f"Display calibrated - offset stored (raw roll={raw_attitude['roll']:.2f}, "
+        f"raw pitch={raw_attitude['pitch']:.2f}). This only affects the GUI display.")
+
+
+def on_close():
+    armed["value"] = False
+    stop_stream.set()
+    time.sleep(0.2)
+    stop_telemetry()
+    if state["cf"] is not None:
+        try:
+            state["cf"].close_link()
+        except Exception:
+            pass
+    video_stream.stop()
+    root.destroy()
+
+
+# --- GUI layout ---
+root = tk.Tk()
+root.title("LiteWing Control Panel")
+root.geometry("940x820")
+
+main_frame = tk.Frame(root)
+main_frame.pack(fill="both", expand=True)
+
+# Left column: everything from the original control panel, unchanged logic,
+# just re-parented from `root` to `left_frame`.
+left_frame = tk.Frame(main_frame, width=420)
+left_frame.pack(side="left", fill="y", padx=(6, 3), pady=6)
+
+# Right column: new ESP32-CAM video panel.
+right_frame = tk.Frame(main_frame, bg="black")
+right_frame.pack(side="left", fill="both", expand=True, padx=(3, 6), pady=6)
+
+title_label = tk.Label(left_frame, text="LiteWing Drone Control", font=("Segoe UI", 14, "bold"))
+title_label.pack(pady=8)
+
+uri_label = tk.Label(left_frame, text=f"Target: {DRONE_URI}", font=("Segoe UI", 9), fg="#555555")
+uri_label.pack()
+
+status_var = tk.StringVar(value="Not connected")
+status_label = tk.Label(left_frame, textvariable=status_var, font=("Segoe UI", 10, "bold"), fg="#c62828")
+status_label.pack(pady=4)
+
+connect_btn = tk.Button(left_frame, text="Connect", width=14, height=1, bg="#1976D2", fg="white",
+                         font=("Segoe UI", 10, "bold"), command=do_connect)
+connect_btn.pack(pady=6)
+
+btn_frame = tk.Frame(left_frame)
+btn_frame.pack(pady=8)
+
+start_btn = tk.Button(btn_frame, text="Start", width=12, height=2, bg="#4CAF50", fg="white",
+                       font=("Segoe UI", 11, "bold"), command=do_start, state=tk.DISABLED)
+start_btn.grid(row=0, column=0, padx=10)
+
+stop_btn = tk.Button(btn_frame, text="Stop", width=12, height=2, bg="#E53935", fg="white",
+                      font=("Segoe UI", 11, "bold"), command=do_stop, state=tk.DISABLED)
+stop_btn.grid(row=0, column=1, padx=10)
+
+# --- Telemetry section ---
+telem_frame = tk.LabelFrame(left_frame, text="Live Attitude", font=("Segoe UI", 10, "bold"), padx=10, pady=10)
+telem_frame.pack(pady=10, padx=10, fill="x")
+
+roll_var = tk.StringVar(value="--")
+pitch_var = tk.StringVar(value="--")
+
+roll_row = tk.Frame(telem_frame)
+roll_row.pack(fill="x")
+tk.Label(roll_row, text="Roll:", font=("Segoe UI", 11), width=8, anchor="w").pack(side="left")
+tk.Label(roll_row, textvariable=roll_var, font=("Consolas", 12, "bold"), fg="#1976D2").pack(side="left")
+
+pitch_row = tk.Frame(telem_frame)
+pitch_row.pack(fill="x")
+tk.Label(pitch_row, text="Pitch:", font=("Segoe UI", 11), width=8, anchor="w").pack(side="left")
+tk.Label(pitch_row, textvariable=pitch_var, font=("Consolas", 12, "bold"), fg="#1976D2").pack(side="left")
+
+tk.Button(telem_frame, text="Calibrate (zero display)", command=do_calibrate, bg="#607D8B", fg="white",
+          font=("Segoe UI", 9, "bold")).pack(pady=6)
+
+# --- Manual control section ---
+manual_frame = tk.LabelFrame(left_frame, text="Manual Control (commanded values)", font=("Segoe UI", 10, "bold"), padx=10, pady=10)
+manual_frame.pack(pady=10, padx=10, fill="x")
+
+cmd_roll_var = tk.StringVar(value="0.0°")
+cmd_pitch_var = tk.StringVar(value="0.0°")
+cmd_thrust_var = tk.StringVar(value="10000")
+
+# Throttle row
+thr_row = tk.Frame(manual_frame)
+thr_row.pack(fill="x", pady=3)
+tk.Label(thr_row, text="Throttle:", width=9, anchor="w").pack(side="left")
+tk.Button(thr_row, text="−", width=4, command=lambda: adjust_thrust(-THRUST_STEP)).pack(side="left", padx=3)
+tk.Label(thr_row, textvariable=cmd_thrust_var, font=("Consolas", 10, "bold"), width=8).pack(side="left")
+tk.Button(thr_row, text="+", width=4, command=lambda: adjust_thrust(THRUST_STEP)).pack(side="left", padx=3)
+
+# Pitch row
+pitch_row2 = tk.Frame(manual_frame)
+pitch_row2.pack(fill="x", pady=3)
+tk.Label(pitch_row2, text="Pitch:", width=9, anchor="w").pack(side="left")
+tk.Button(pitch_row2, text="−", width=4, command=lambda: adjust_pitch(-ROLL_PITCH_STEP)).pack(side="left", padx=3)
+tk.Label(pitch_row2, textvariable=cmd_pitch_var, font=("Consolas", 10, "bold"), width=8).pack(side="left")
+tk.Button(pitch_row2, text="+", width=4, command=lambda: adjust_pitch(ROLL_PITCH_STEP)).pack(side="left", padx=3)
+
+# Roll row
+roll_row2 = tk.Frame(manual_frame)
+roll_row2.pack(fill="x", pady=3)
+tk.Label(roll_row2, text="Roll:", width=9, anchor="w").pack(side="left")
+tk.Button(roll_row2, text="−", width=4, command=lambda: adjust_roll(-ROLL_PITCH_STEP)).pack(side="left", padx=3)
+tk.Label(roll_row2, textvariable=cmd_roll_var, font=("Consolas", 10, "bold"), width=8).pack(side="left")
+tk.Button(roll_row2, text="+", width=4, command=lambda: adjust_roll(ROLL_PITCH_STEP)).pack(side="left", padx=3)
+
+# Center / reset button
+tk.Button(manual_frame, text="Center (level)", command=center_attitude, bg="#FFA000", fg="white",
+          font=("Segoe UI", 9, "bold")).pack(pady=6)
+
+log_box = scrolledtext.ScrolledText(left_frame, width=48, height=10, font=("Consolas", 9))
+log_box.pack(pady=10, padx=10)
+
+# --- Video panel (ESP32-CAM feed via GStreamer) ---
+video_status_var = tk.StringVar(value="Video: starting...")
+video_status_label = tk.Label(right_frame, textvariable=video_status_var, font=("Segoe UI", 9),
+                               fg="#cccccc", bg="black")
+video_status_label.pack(pady=4)
+
+video_label = tk.Label(right_frame, bg="black")
+video_label.pack(fill="both", expand=True)
+
+video_stream = VideoStream(VIDEO_PIPELINE, video_label, video_status_var.set)
+video_stream.start()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()
